@@ -190,7 +190,7 @@ class RealTimeSMPLFitter:
     def __init__(self, model_path, gender='neutral', device='cuda'):
         self.device = torch.device(device)
         
-        # 加载模型
+        # Load SMPLX model
         self.model = smplx.create(
             model_path=model_path,
             model_type='smplx',
@@ -199,10 +199,7 @@ class RealTimeSMPLFitter:
             batch_size=1
         ).to(self.device)
         
-        # --- 状态保持 ---
         self.transl = torch.zeros((1, 3), dtype=torch.float32, device=self.device, requires_grad=True)
-        # [修改] 初始旋转：绕 X 轴旋转 180 度 (pi)，因为 RealSense 往往 Y 轴是指向下的，而 SMPL 是向上的
-        # 如果依然不对，尝试改为 0 或者 torch.tensor([0, 0, 0])
         init_rot = torch.tensor([np.pi, 0, 0], dtype=torch.float32, device=self.device) 
         self.global_orient = init_rot.reshape(1, 3).detach().requires_grad_(True)
         
@@ -215,7 +212,7 @@ class RealTimeSMPLFitter:
         if len(pcd_points) < 10:
             return None
 
-        # 1. 降采样 (保持 500-800 点以保证速度)
+        # Downsample point cloud
         if len(pcd_points) > 800:
             indices = np.random.choice(len(pcd_points), 800, replace=False)
             pcd_subset = pcd_points[indices]
@@ -224,20 +221,17 @@ class RealTimeSMPLFitter:
             
         target_tensor = torch.from_numpy(pcd_subset).float().to(self.device)
 
-        # 2. 冷启动逻辑 (修正位置)
+        # Cold start logic (correct position)
         if not self.is_initialized:
             centroid = torch.mean(target_tensor, dim=0)
             with torch.no_grad():
-                # [修改] 将模型位置设置在点云中心下方 0.2 米处
-                # 因为点云中心大约在胸腹部，而 SMPL 根节点在骨盆，需要往下移一点
                 self.transl[:] = centroid
                 self.transl[0, 1] += 0.2 
             self.is_initialized = True
-            current_iters = 30 # 第一帧多跑几次
+            current_iters = 30 
         else:
             current_iters = iterations
 
-        # 3. 优化器
         optimizer = torch.optim.Adam([self.transl, self.global_orient, self.betas, self.body_pose], lr=0.01)
 
         for i in range(current_iters):
@@ -252,10 +246,8 @@ class RealTimeSMPLFitter:
             )
             vertices = output.vertices[0]
             
-            # --- 距离计算 (简化版) ---
-            # 找到每个点云点最近的 mesh 顶点
+            # Distance calculation
             diff = target_tensor.unsqueeze(1) - vertices.unsqueeze(0) # [N, V, 3]
-            # 为了显存不爆炸，我们只随机取 Mesh 的一部分顶点做近似计算 (例如 2000 个)
             if vertices.shape[0] > 2000:
                  v_indices = torch.randperm(vertices.shape[0])[:2000]
                  diff = diff[:, v_indices, :]
@@ -264,12 +256,9 @@ class RealTimeSMPLFitter:
             min_dist, _ = torch.min(dist_sq, dim=1)
             loss_fitting = torch.mean(min_dist)
             
-            # --- [重要] 正则化加强 ---
-            # 大幅增加 pose 的惩罚权重，强迫它保持像个人，而不是扭成一团
             loss_pose = torch.mean(self.body_pose ** 2)
             loss_shape = torch.mean(self.betas ** 2)
             
-            # 权重调整： fitting 权重降低，pose 权重拉高
             loss = loss_fitting * 20.0 + loss_pose * 5.0 + loss_shape * 1.0
             
             loss.backward()
@@ -287,7 +276,6 @@ class RealTimeSMPLFitter:
             
         return verts, faces
     
-    # [新增] 重置功能，如果乱了可以手动重置
     def reset(self):
         self.is_initialized = False
         with torch.no_grad():

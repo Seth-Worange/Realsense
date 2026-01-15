@@ -2,7 +2,7 @@
 Author: Seth-Worange
 Date: 2026-01-10 19:53:50
 LastEditors: Seth-Worange
-LastEditTime: 2026-01-13 23:11:42
+LastEditTime: 2026-01-15 14:42:33
 FilePath: \Realsense\reconstruction\pcdRebuild.py
 Description: 
     Reconstruct point clouds from RealSense D435, extract and process foreground objects.
@@ -30,7 +30,7 @@ class HumanSegUI:
         
         self.show_rgb = False
         
-        self.vis_min_dist = 0.0 
+        self.vis_min_dist = 0.0
         self.vis_max_dist = 4.0
 
         self.app = gui.Application.instance

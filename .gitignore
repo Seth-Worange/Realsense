@@ -1,4 +1,5 @@
-"reconstruction/models/smplx/*.npz" 
-"reconstruction/models/mediapipe/*.tflite" 
+reconstruction/models/smplx/*.npz
+reconstruction/models/mediapipe/*.tflite
 reconstruction/models/smplx/SMPLX_NEUTRAL.npz
 reconstruction/models/mediapipe/selfie_segmenter.tflite
+reconstruction/models/mediapipe/pose_landmarker_heavy.task
