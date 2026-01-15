@@ -2,7 +2,7 @@
 Author: Seth-Worange
 Date: 2026-01-10 19:53:50
 LastEditors: Seth-Worange
-LastEditTime: 2026-01-15 14:42:33
+LastEditTime: 2026-01-15 17:29:17
 FilePath: \Realsense\reconstruction\pcdRebuild.py
 Description: 
     Reconstruct point clouds from RealSense D435, extract and process foreground objects.
@@ -35,7 +35,7 @@ class HumanSegUI:
 
         self.app = gui.Application.instance
         self.app.initialize()
-        self.window = self.app.create_window("RealSense Human Reconstruction", 1400, 920)
+        self.window = self.app.create_window("RealSense Human Reconstruction", 1400, 1050)
         self.window.set_on_close(self._on_close)
         self.window.set_on_layout(self._on_layout)
         
@@ -54,6 +54,16 @@ class HumanSegUI:
         self.rgb_check.checked = False
         self.rgb_check.set_on_checked(self._on_rgb_toggle)
         
+        self.pcd_check = gui.Checkbox("Show Point Cloud")
+        self.pcd_check.checked = True
+        self.show_pcd = True
+        self.pcd_check.set_on_checked(self._on_pcd_toggle)
+
+        self.skel_check = gui.Checkbox("Show 3D Skeleton (Body/Hand/Face)")
+        self.skel_check.checked = False
+        self.show_skeleton = False
+        self.skel_check.set_on_checked(self._on_skeleton_toggle)
+
         self.thresh_slider = gui.Slider(gui.Slider.DOUBLE) 
         self.thresh_slider.set_limits(0.5, 5.0) 
         self.thresh_slider.double_value = self.processor.clip_distance_m
@@ -66,7 +76,9 @@ class HumanSegUI:
         # Layout Adding
         self.side_panel.add_child(gui.Label("View Mode"))
         self.side_panel.add_child(self.mode_combo)
+        self.side_panel.add_child(self.pcd_check)
         self.side_panel.add_child(self.rgb_check)
+        self.side_panel.add_child(self.skel_check)
         self.side_panel.add_child(gui.Label("Geometry Clip Dist (m)"))
         self.side_panel.add_child(self.thresh_slider)
 
@@ -78,7 +90,19 @@ class HumanSegUI:
         
         self.scene_widget = gui.SceneWidget()
         self.scene_widget.scene = rendering.Open3DScene(self.window.renderer)
-        self.scene_widget.scene.set_background([0.1, 0.1, 0.1, 1.0])
+        self.scene_widget.scene.set_background([0.02, 0.02, 0.05, 1.0])
+
+        smpl_path = 'C:/OrangeFiles/科研/Realsense/reconstruction/models/smplx/SMPLX_NEUTRAL.npz'
+        try:
+            self.smpl_fitter = RealTimeSMPLFitter(smpl_path) 
+            self.show_smpl = False
+        except Exception as e:
+            print(f"SMPL Init Warning: {e}")
+            self.smpl_fitter = None
+        
+        self.smpl_check = gui.Checkbox("Enable SMPL Fitting")
+        self.smpl_check.set_on_checked(lambda c: setattr(self, 'show_smpl', c))
+        self.side_panel.add_child(self.smpl_check)
         
         self.window.add_child(self.side_panel)
         self.window.add_child(self.scene_widget)
@@ -107,9 +131,21 @@ class HumanSegUI:
     def _on_rgb_toggle(self, is_checked):
         self.show_rgb = is_checked
 
+    def _on_pcd_toggle(self, is_checked):
+        self.show_pcd = is_checked
+
+    def _on_skeleton_toggle(self, is_checked):
+        self.show_skeleton = is_checked
+
     def run_loop(self):
         first_run = True
-        gray_color = [0.5, 0.5, 0.5]
+        # Aesthetic Colors
+        pcd_color = [0.0, 0.6, 0.8] # Metallic Blue
+        smpl_mesh = None
+        
+        # Connections
+        POSE_CONN = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[24,26],[25,27],[26,28],[27,29],[28,30]]
+        HAND_CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]]
 
         while self.is_running:
             t0 = time.time()
@@ -123,8 +159,83 @@ class HumanSegUI:
             pcd = data['pcd']
             
             if len(pcd.points) > 0 and not self.show_rgb:
-                pcd.paint_uniform_color(gray_color)
+                pcd.paint_uniform_color(pcd_color)
+
+            # =========================================================
+            # SMPL fitting logic
+            # =========================================================
+            fitted_geom = None
+            # Only run when: 1. User enables SMPL display 2. Fitter is initialized 3. Point cloud has enough points
+            if self.show_smpl and hasattr(self, 'smpl_fitter') and self.smpl_fitter is not None and len(pcd.points) > 50:
+                points_np = np.asarray(pcd.points)
+                kp_3d = data.get('keypoints_3d', None)
+                result = self.smpl_fitter.fit(points_np, keypoints_3d=kp_3d, iterations=6) 
                 
+                if result:
+                    verts, faces = result
+                    if smpl_mesh is None:
+                        smpl_mesh = o3d.geometry.TriangleMesh()
+                    smpl_mesh.vertices = o3d.utility.Vector3dVector(verts)
+                    smpl_mesh.triangles = o3d.utility.Vector3iVector(faces)
+                    smpl_mesh.compute_vertex_normals()
+                    smpl_mesh.paint_uniform_color([1, 0.8, 0.6]) # Set to skin color
+                    fitted_geom = smpl_mesh
+            
+            # =========================================================
+            # Skeleton Rendering Prep
+            # =========================================================
+            skel_geoms = {} # name -> geometry
+            if self.show_skeleton:
+                skel_data = data.get('skeleton_data', {})
+                
+                # 1. Pose
+                if 'pose' in skel_data and skel_data['pose']:
+                    points = skel_data['pose']
+                    valid_inds = [i for i, p in enumerate(points) if p is not None]
+                    if len(valid_inds) > 0:
+                        # O3D LineSet needs strict dense points, so we map sparse indices to dense
+                        dense_points = [points[i] for i in valid_inds]
+                        map_idx = {orig: new for new, orig in enumerate(valid_inds)}
+                        
+                        lines = []
+                        for s, e in POSE_CONN:
+                            if s in map_idx and e in map_idx:
+                                lines.append([map_idx[s], map_idx[e]])
+                        
+                        if lines:
+                            ls = o3d.geometry.LineSet()
+                            ls.points = o3d.utility.Vector3dVector(dense_points)
+                            ls.lines = o3d.utility.Vector2iVector(lines)
+                            ls.paint_uniform_color([1.0, 0.84, 0.0]) # Gold body
+                            skel_geoms['skel_pose'] = ls
+
+                # 2. Hands
+                if 'hands' in skel_data:
+                    for i, hand_pts in enumerate(skel_data['hands']):
+                        valid_inds = [k for k, p in enumerate(hand_pts) if p is not None]
+                        if len(valid_inds) > 0:
+                            dense_points = [hand_pts[k] for k in valid_inds]
+                            map_idx = {orig: new for new, orig in enumerate(valid_inds)}
+                            lines = []
+                            for s, e in HAND_CONN:
+                                if s in map_idx and e in map_idx:
+                                    lines.append([map_idx[s], map_idx[e]])
+                            if lines:
+                                ls = o3d.geometry.LineSet()
+                                ls.points = o3d.utility.Vector3dVector(dense_points)
+                                ls.lines = o3d.utility.Vector2iVector(lines)
+                                ls.paint_uniform_color([1.0, 0.0, 0.5]) # Hot Pink hands
+                                skel_geoms[f'skel_hand_{i}'] = ls
+                
+                # 3. Face
+                if 'face' in skel_data and skel_data['face']:
+                    face_pts = [p for p in skel_data['face'] if p is not None]
+                    if len(face_pts) > 0:
+                        pc = o3d.geometry.PointCloud()
+                        pc.points = o3d.utility.Vector3dVector(face_pts)
+                        pc.paint_uniform_color([0.8, 1.0, 1.0]) # Cyan face dots
+                        skel_geoms['skel_face'] = pc
+
             # UI Preview logic
             preview_w = self.sidebar_width - 20
             preview_h = int(preview_w * 0.75)
@@ -158,11 +269,40 @@ class HumanSegUI:
                 if scene.has_geometry("pcd"): 
                     scene.remove_geometry("pcd")
                 
-                mat = rendering.MaterialRecord()
-                mat.shader = "defaultUnlit"
-                mat.point_size = 3.0 
-                scene.add_geometry("pcd", pcd, mat)
+                if self.show_pcd:
+                    mat = rendering.MaterialRecord()
+                    mat.shader = "defaultUnlit"
+                    mat.point_size = 3.0 
+                    scene.add_geometry("pcd", pcd, mat)
+
+                # SMPL Rendering
+                if scene.has_geometry("smpl"):
+                    scene.remove_geometry("smpl")
                 
+                if fitted_geom is not None:
+                    mat_smpl = rendering.MaterialRecord()
+                    mat_smpl.shader = "defaultLit" # Use lit shader for better muscle visibility
+                    scene.add_geometry("smpl", fitted_geom, mat_smpl)
+                
+                # Skeleton Rendering Update
+                for name in ["skel_pose", "skel_face", "skel_hand_0", "skel_hand_1"]:
+                     if scene.has_geometry(name): scene.remove_geometry(name)
+ 
+                if self.show_skeleton:
+                    mat_line = rendering.MaterialRecord()
+                    mat_line.shader = "unlitLine"
+                    mat_line.line_width = 3.0
+                    
+                    mat_pt = rendering.MaterialRecord()
+                    mat_pt.shader = "defaultUnlit"
+                    mat_pt.point_size = 5.0
+
+                    for name, geom in skel_geoms.items():
+                        if isinstance(geom, o3d.geometry.LineSet):
+                             scene.add_geometry(name, geom, mat_line)
+                        else:
+                             scene.add_geometry(name, geom, mat_pt)
+
                 nonlocal first_run
                 if first_run and len(pcd.points) > 0:
                     bounds = scene.bounding_box
@@ -175,6 +315,8 @@ class HumanSegUI:
                     first_run = False
             
             self.app.post_to_main_thread(self.window, update)
+            
+
     def run(self):
         self.app.run()
 
