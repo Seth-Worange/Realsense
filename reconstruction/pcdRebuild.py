@@ -2,7 +2,7 @@
 Author: Seth-Worange
 Date: 2026-01-10 19:53:50
 LastEditors: Seth-Worange
-LastEditTime: 2026-01-15 17:29:17
+LastEditTime: 2026-01-16 18:01:37
 FilePath: \Realsense\reconstruction\pcdRebuild.py
 Description: 
     Reconstruct point clouds from RealSense D435, extract and process foreground objects.
@@ -35,14 +35,17 @@ class HumanSegUI:
 
         self.app = gui.Application.instance
         self.app.initialize()
-        self.window = self.app.create_window("RealSense Human Reconstruction", 1400, 1050)
+        self.window = self.app.create_window("RealSense Human Reconstruction", 1400, 950)
         self.window.set_on_close(self._on_close)
         self.window.set_on_layout(self._on_layout)
         
-        self.sidebar_width = 400
-        self.side_panel = gui.Vert(10, gui.Margins(10, 10, 10, 10))
+        self.sidebar_width = 450
+        self.side_panel = gui.ScrollableVert(0, gui.Margins(10, 10, 10, 10))
         
-        # Existing Controls
+        # --- Group 1: View Options ---
+        self.view_group = gui.CollapsableVert("View Options", 0.3 * 16, gui.Margins(5,5,5,5))
+        self.view_group.set_is_open(True)
+        
         self.mode_combo = gui.Combobox()
         self.mode_combo.add_item("Full Scene")
         self.mode_combo.add_item("Human Only (AI)")
@@ -50,38 +53,87 @@ class HumanSegUI:
         self.mode_combo.selected_index = 1 
         self.mode_combo.set_on_selection_changed(self._on_mode_change)
         
-        self.rgb_check = gui.Checkbox("Show RGB Texture")
-        self.rgb_check.checked = False
-        self.rgb_check.set_on_checked(self._on_rgb_toggle)
+        # Display toggles in a horizontal row for compactness
+        display_row = gui.Horiz(5)
         
-        self.pcd_check = gui.Checkbox("Show Point Cloud")
+        self.pcd_check = gui.Checkbox("Point Cloud")
         self.pcd_check.checked = True
         self.show_pcd = True
         self.pcd_check.set_on_checked(self._on_pcd_toggle)
+        
+        self.rgb_check = gui.Checkbox("Texture")
+        self.rgb_check.checked = False
+        self.rgb_check.set_on_checked(self._on_rgb_toggle)
 
-        self.skel_check = gui.Checkbox("Show 3D Skeleton (Body/Hand/Face)")
+        self.skel_check = gui.Checkbox("Skeleton")
         self.skel_check.checked = False
         self.show_skeleton = False
         self.skel_check.set_on_checked(self._on_skeleton_toggle)
+        
+        # self.view_group.add_child(gui.Label("View Mode"))
+        self.view_group.add_child(self.mode_combo)
+        
+        display_row.add_child(self.pcd_check)
+        display_row.add_child(self.rgb_check)
+        display_row.add_child(self.skel_check)
+        self.view_group.add_child(display_row)
 
+        # --- Group 2: Reconstruction ---
+        self.recon_group = gui.CollapsableVert("Reconstruction", 0.3 * 16, gui.Margins(5,5,5,5))
+        self.recon_group.set_is_open(True)
+        
+        smpl_path = 'C:/OrangeFiles/科研/Realsense/reconstruction/models/smplx/SMPLX_NEUTRAL.npz'
+        try:
+            self.smpl_fitter = RealTimeSMPLFitter(smpl_path) 
+            self.show_smpl = False
+        except Exception as e:
+            print(f"SMPL Init Warning: {e}")
+            self.smpl_fitter = None
+        
+        recon_row = gui.Horiz(5)
+        
+        # Use spaces for approximate vertical alignment with top row
+        self.smpl_check = gui.Checkbox("SMPL        ") 
+        self.smpl_check.set_on_checked(lambda c: setattr(self, 'show_smpl', c))
+        
+        self.face_check = gui.Checkbox("Face     ")
+        self.face_check.checked = False 
+        self.face_check.set_on_checked(self._on_face_toggle)
+        self.processor.enable_face = False # Sync initial state
+
+        self.hand_check = gui.Checkbox("Hand   ")
+        self.hand_check.checked = False
+        self.hand_check.set_on_checked(self._on_hand_toggle)
+        self.processor.enable_hand = False # Sync initial state
+
+        recon_row.add_child(self.smpl_check)
+        recon_row.add_child(self.face_check)
+        recon_row.add_child(self.hand_check)
+        self.recon_group.add_child(recon_row)
+
+        # Add Collapsable Groups FIRST
+        self.side_panel.add_child(self.view_group)
+        self.side_panel.add_child(self.recon_group)
+
+        # --- Parameters (Flat) ---
+        
+        param_row = gui.Horiz(10)
+        param_row.add_child(gui.Label("Clip(m)"))
         self.thresh_slider = gui.Slider(gui.Slider.DOUBLE) 
         self.thresh_slider.set_limits(0.5, 5.0) 
         self.thresh_slider.double_value = self.processor.clip_distance_m
         self.thresh_slider.set_on_value_changed(self._on_thresh_change)
+        
+        param_row.add_child(self.thresh_slider)
+        self.side_panel.add_child(param_row)
+
+        # --- Stream Monitor (Flat) ---
+        self.side_panel.add_child(gui.Label("")) # Filler for spacing
 
         self.rgb_widget = gui.ImageWidget()
         self.depth_widget = gui.ImageWidget()
         self.status_label = gui.Label("Status: Ready")
         
-        # Layout Adding
-        self.side_panel.add_child(gui.Label("View Mode"))
-        self.side_panel.add_child(self.mode_combo)
-        self.side_panel.add_child(self.pcd_check)
-        self.side_panel.add_child(self.rgb_check)
-        self.side_panel.add_child(self.skel_check)
-        self.side_panel.add_child(gui.Label("Geometry Clip Dist (m)"))
-        self.side_panel.add_child(self.thresh_slider)
-
         self.side_panel.add_child(gui.Label("Color Stream"))
         self.side_panel.add_child(self.rgb_widget)
         self.side_panel.add_child(gui.Label("Segmentation Mask"))
@@ -91,18 +143,6 @@ class HumanSegUI:
         self.scene_widget = gui.SceneWidget()
         self.scene_widget.scene = rendering.Open3DScene(self.window.renderer)
         self.scene_widget.scene.set_background([0.02, 0.02, 0.05, 1.0])
-
-        smpl_path = 'C:/OrangeFiles/科研/Realsense/reconstruction/models/smplx/SMPLX_NEUTRAL.npz'
-        try:
-            self.smpl_fitter = RealTimeSMPLFitter(smpl_path) 
-            self.show_smpl = False
-        except Exception as e:
-            print(f"SMPL Init Warning: {e}")
-            self.smpl_fitter = None
-        
-        self.smpl_check = gui.Checkbox("Enable SMPL Fitting")
-        self.smpl_check.set_on_checked(lambda c: setattr(self, 'show_smpl', c))
-        self.side_panel.add_child(self.smpl_check)
         
         self.window.add_child(self.side_panel)
         self.window.add_child(self.scene_widget)
@@ -113,6 +153,11 @@ class HumanSegUI:
 
     def _on_layout(self, ctx):
         r = self.window.content_rect
+        # Responsive: Sidebar is 33% of window width
+        self.sidebar_width = int(r.width * 0.3)
+        # Minimum width check
+        if self.sidebar_width < 300: self.sidebar_width = 300
+        
         self.side_panel.frame = gui.Rect(r.x, r.y, self.sidebar_width, r.height)
         self.scene_widget.frame = gui.Rect(r.x + self.sidebar_width, r.y, r.width - self.sidebar_width, r.height)
 
@@ -136,6 +181,12 @@ class HumanSegUI:
 
     def _on_skeleton_toggle(self, is_checked):
         self.show_skeleton = is_checked
+
+    def _on_face_toggle(self, is_checked):
+        self.processor.enable_face = is_checked
+
+    def _on_hand_toggle(self, is_checked):
+        self.processor.enable_hand = is_checked
 
     def run_loop(self):
         first_run = True
@@ -161,15 +212,19 @@ class HumanSegUI:
             if len(pcd.points) > 0 and not self.show_rgb:
                 pcd.paint_uniform_color(pcd_color)
 
-            # =========================================================
             # SMPL fitting logic
-            # =========================================================
             fitted_geom = None
             # Only run when: 1. User enables SMPL display 2. Fitter is initialized 3. Point cloud has enough points
             if self.show_smpl and hasattr(self, 'smpl_fitter') and self.smpl_fitter is not None and len(pcd.points) > 50:
                 points_np = np.asarray(pcd.points)
-                kp_3d = data.get('keypoints_3d', None)
-                result = self.smpl_fitter.fit(points_np, keypoints_3d=kp_3d, iterations=6) 
+                kp_info = data.get('keypoints_info', None)
+                
+                # Extract intrinsics for 2D reprojection
+                intr = self.processor.pinhole_intrinsics.intrinsic_matrix
+                w, h = self.processor.width, self.processor.height
+                intr_params = (intr[0,0], intr[1,1], intr[0,2], intr[1,2], w, h)
+                
+                result = self.smpl_fitter.fit(points_np, keypoints_info=kp_info, intrinsics=intr_params, iterations=5) 
                 
                 if result:
                     verts, faces = result
@@ -181,9 +236,7 @@ class HumanSegUI:
                     smpl_mesh.paint_uniform_color([1, 0.8, 0.6]) # Set to skin color
                     fitted_geom = smpl_mesh
             
-            # =========================================================
-            # Skeleton Rendering Prep
-            # =========================================================
+            # Skeleton Rendering
             skel_geoms = {} # name -> geometry
             if self.show_skeleton:
                 skel_data = data.get('skeleton_data', {})
@@ -193,7 +246,6 @@ class HumanSegUI:
                     points = skel_data['pose']
                     valid_inds = [i for i, p in enumerate(points) if p is not None]
                     if len(valid_inds) > 0:
-                        # O3D LineSet needs strict dense points, so we map sparse indices to dense
                         dense_points = [points[i] for i in valid_inds]
                         map_idx = {orig: new for new, orig in enumerate(valid_inds)}
                         
@@ -237,7 +289,9 @@ class HumanSegUI:
                         skel_geoms['skel_face'] = pc
 
             # UI Preview logic
-            preview_w = self.sidebar_width - 20
+            # Dynamic resizing based on current sidebar width
+            preview_w = self.sidebar_width - 40 # Margin adjustment
+            if preview_w < 100: preview_w = 100
             preview_h = int(preview_w * 0.75)
             
             rgb_small = cv2.resize(data['color'], (preview_w, preview_h))

@@ -40,6 +40,24 @@ class RealSenseProcessor:
         self.clip_distance_m = 3.0 
         self.voxel_size = 0.02
         self.human_depth_tolerance = 0.7 
+        self.enable_face = True
+        self.enable_hand = True 
+
+        # Hardware Filters
+        self.decimation = rs.decimation_filter()
+        self.decimation.set_option(rs.option.filter_magnitude, 1) # 1 = No decimation
+        
+        self.spatial = rs.spatial_filter()
+        self.spatial.set_option(rs.option.filter_magnitude, 2)
+        self.spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
+        self.spatial.set_option(rs.option.filter_smooth_delta, 20)
+        self.spatial.set_option(rs.option.holes_fill, 0)
+        
+        self.temporal = rs.temporal_filter()
+        self.temporal.set_option(rs.option.filter_smooth_alpha, 0.4)
+        self.temporal.set_option(rs.option.filter_smooth_delta, 20)
+        
+        self.hole_filling = rs.hole_filling_filter()
 
         # Initialize MediaPipe
         self.mp_pose = None
@@ -113,11 +131,33 @@ class RealSenseProcessor:
     def _deproject_pixel(self, x, y, depth_frame, intr):
         if x < 0 or x >= self.width or y < 0 or y >= self.height:
             return None
+            
+        # 1. Try Center Pixel
         dist = depth_frame.get_distance(x, y)
-        if dist <= 0 or dist > 3.0: return None
+        
+        # 2. Robust Search: If invalid or noisy, search neighborhood
+        # Fingertips often have noisy depth edges.
+        if dist <= 0 or dist > 3.0:
+            valid_depths = []
+            radius = 2 # 5x5 window
+            for dy in range(-radius, radius+1):
+                for dx in range(-radius, radius+1):
+                    if dx == 0 and dy == 0: continue
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < self.width and 0 <= ny < self.height:
+                        d = depth_frame.get_distance(nx, ny)
+                        if 0 < d <= 3.0:
+                            valid_depths.append(d)
+            
+            if valid_depths:
+                # Use median to avoid outliers
+                dist = np.median(valid_depths)
+            else:
+                return None
+
         return rs.rs2_deproject_pixel_to_point(intr, [x, y], dist)
 
-    # Execute inference, return: (segmentation mask, skeleton_data dict)
+    # Execute inference, return: (segmentation mask, skeleton_data dict, keypoints_info list)
     def _analyze_pose_and_keypoints(self, color_img, depth_frame):
         default_mask = np.zeros((self.height, self.width), dtype=np.uint8)
         
@@ -128,11 +168,11 @@ class RealSenseProcessor:
             'face': []   # List of points
         }
         
-        # Structure for SMPL fitting
-        keypoints_3d_smpl = [] 
+        # Structure for SMPL fitting: [idx, x3d, y3d, z3d, x2d, y2d, visibility]
+        keypoints_info = [] 
 
         if not self.mp_pose:
-            return default_mask, skeleton_data, keypoints_3d_smpl
+            return default_mask, skeleton_data, keypoints_info
 
         # 1. Image preprocessing
         img_rgb = cv2.cvtColor(color_img, cv2.COLOR_BGR2RGB)
@@ -157,25 +197,47 @@ class RealSenseProcessor:
                 p3d = self._deproject_pixel(px, py, depth_frame, intr)
                 if p3d:
                     curr_pose_3d.append(p3d)
-                    # Add to SMPL list
-                    keypoints_3d_smpl.append([idx, p3d[0], p3d[1], p3d[2]])
+                    # Add to SMPL list with 2D info and visibility
+                    # lm.x, lm.y are normalized [0,1]
+                    vis = lm.visibility if hasattr(lm, 'visibility') else 1.0
+                    keypoints_info.append([idx, p3d[0], p3d[1], p3d[2], lm.x, lm.y, vis])
                 else:
                     curr_pose_3d.append(None) # Keep index structure for drawing lines
             skeleton_data['pose'] = curr_pose_3d
 
-        # --- B. Hand Detection ---
-        if self.mp_hand:
-            hand_result = self.mp_hand.detect(mp_image)
-            for hand_lms in hand_result.hand_landmarks:
-                curr_hand_3d = []
-                for lm in hand_lms:
-                    px, py = int(lm.x * self.width), int(lm.y * self.height)
-                    p3d = self._deproject_pixel(px, py, depth_frame, intr)
-                    curr_hand_3d.append(p3d if p3d else None)
-                skeleton_data['hands'].append(curr_hand_3d)
+        # --- B. Hand Detection (Adaptive) ---
+        # Strategy: Only run heavy Hand Landmarker if hand is close enough (large pixel size)
+        # We use Pose landmarks as a proxy to estimate hand size.
+        if self.enable_hand and self.mp_hand and pose_result.pose_landmarks:
+            landmarks = pose_result.pose_landmarks[0]
+            
+            # Check Left Hand Size (Wrist 15 -> Index 19)
+            left_hand_size = 0
+            if 15 < len(landmarks) and 19 < len(landmarks):
+                dx = (landmarks[15].x - landmarks[19].x) * self.width
+                dy = (landmarks[15].y - landmarks[19].y) * self.height
+                left_hand_size = (dx**2 + dy**2)**0.5
+            
+            # Check Right Hand Size (Wrist 16 -> Index 20)
+            right_hand_size = 0
+            if 16 < len(landmarks) and 20 < len(landmarks):
+                dx = (landmarks[16].x - landmarks[20].x) * self.width
+                dy = (landmarks[16].y - landmarks[20].y) * self.height
+                right_hand_size = (dx**2 + dy**2)**0.5
+            
+            # Threshold: e.g. 40 pixels
+            if left_hand_size > 40 or right_hand_size > 40:
+                hand_result = self.mp_hand.detect(mp_image)
+                for hand_lms in hand_result.hand_landmarks:
+                    curr_hand_3d = []
+                    for lm in hand_lms:
+                        px, py = int(lm.x * self.width), int(lm.y * self.height)
+                        p3d = self._deproject_pixel(px, py, depth_frame, intr)
+                        curr_hand_3d.append(p3d if p3d else None)
+                    skeleton_data['hands'].append(curr_hand_3d)
 
         # --- C. Face Detection ---
-        if self.mp_face:
+        if self.enable_face and self.mp_face:
             face_result = self.mp_face.detect(mp_image)
             if face_result.face_landmarks and len(face_result.face_landmarks) > 0:
                 face_lms = face_result.face_landmarks[0]
@@ -187,11 +249,11 @@ class RealSenseProcessor:
                     curr_face_3d.append(p3d if p3d else None)
                 skeleton_data['face'] = curr_face_3d
         
-        # Use Pose landmarks (0-10) if high-res face not detected
+        # Fallback: Use Pose landmarks (0-10) if high-res face not detected or disabled
         if not skeleton_data['face'] and len(skeleton_data['pose']) >= 11:
             skeleton_data['face'] = skeleton_data['pose'][0:11]
                             
-        return segmentation_mask, skeleton_data, keypoints_3d_smpl
+        return segmentation_mask, skeleton_data, keypoints_info
 
     # Generate point cloud
     def _generate_point_cloud(self, color_bgr, depth_img):
@@ -251,11 +313,20 @@ class RealSenseProcessor:
             color_frame = aligned_frames.get_color_frame()
             if not depth_frame or not color_frame: return None
             
+            # Apply Filters
+            filtered = self.spatial.process(depth_frame)
+            filtered = self.temporal.process(filtered)
+            filtered = self.hole_filling.process(filtered)
+            
+            # Cast back to depth_frame to access .get_distance()
+            depth_frame = filtered.as_depth_frame()
+            if not depth_frame: return None
+            
             img_color = np.asanyarray(color_frame.get_data())
             img_depth = np.asanyarray(depth_frame.get_data())
             
             # 1. Call new function to get Mask and keypoints
-            semantic_mask, skeleton_data, keypoints_3d_smpl = self._analyze_pose_and_keypoints(img_color, depth_frame)
+            semantic_mask, skeleton_data, keypoints_info = self._analyze_pose_and_keypoints(img_color, depth_frame)
             
             # 2. Process depth image (pass the Mask just obtained)
             masked_depth = self._process_hybrid_mask(img_depth, mode, computed_mask=semantic_mask)
@@ -270,7 +341,7 @@ class RealSenseProcessor:
                 'pcd': pcd,
                 'mode': mode,
                 'skeleton_data': skeleton_data,
-                'keypoints_3d': keypoints_3d_smpl 
+                'keypoints_info': keypoints_info 
             }
         except Exception as e:
             print(f"[Error] Process failed: {e}")
@@ -292,6 +363,12 @@ class RealTimeSMPLFitter:
         self.betas = torch.zeros((1, 10), dtype=torch.float32, device=self.device, requires_grad=True)
         self.body_pose = torch.zeros((1, 63), dtype=torch.float32, device=self.device, requires_grad=True)
         self.is_initialized = False
+        
+        # Motion Smoothness buffers
+        self.prev_pose = None
+        self.prev_betas = None
+        self.prev_transl = None
+        self.prev_orient = None
 
         # MediaPipe ID -> SMPL-X Joint ID (Expanded)
         self.joint_map = {
@@ -304,7 +381,16 @@ class RealTimeSMPLFitter:
             27: 7, 28: 8    # Ankles
         }
 
-    def fit(self, pcd_points, keypoints_3d=None, iterations=5):
+    def project_points(self, points_3d, intrinsics):
+        # intrinsics: [fx, fy, cx, cy]
+        fx, fy, cx, cy = intrinsics
+        # Z should not be zero
+        z = points_3d[:, 2].clamp(min=1e-3)
+        x = points_3d[:, 0] * fx / z + cx
+        y = points_3d[:, 1] * fy / z + cy
+        return torch.stack([x, y], dim=-1)
+
+    def fit(self, pcd_points, keypoints_info=None, intrinsics=None, iterations=5):
         if len(pcd_points) < 10: return None
 
         # 1. Downsample point cloud
@@ -315,108 +401,170 @@ class RealTimeSMPLFitter:
             pcd_subset = pcd_points
         target_tensor = torch.from_numpy(pcd_subset).float().to(self.device)
 
-        # 2. Process 3D joints
+        # 2. Process Keypoints (Hybrid 2D/3D)
         has_joints = False
         smpl_joint_indices = None
-        target_joint_coords = None
-        match_count = 0
+        target_joint_3d = None
+        target_joint_2d = None
+        joint_confidence = None
         
-        # Helper to find specific body parts
         hip_targets = []
+        torso_smpl_indices = [] # For Rigid Phase
+        torso_target_indices = []
         
-        if keypoints_3d and len(keypoints_3d) > 0:
-            smpl_indices_list = []
-            target_coords_list = []
-            for kp in keypoints_3d:
-                mp_idx, x, y, z = kp
+        if keypoints_info and len(keypoints_info) > 0:
+            s_indices = []
+            t_3d = []
+            t_2d = []
+            vis = []
+            
+            # intrinsics tuple: (fx, fy, cx, cy, w, h)
+            width = intrinsics[4] if intrinsics else 640
+            height = intrinsics[5] if intrinsics else 480
+            
+            for i, item in enumerate(keypoints_info):
+                # item: [mp_idx, x, y, z, u_norm, v_norm, visibility]
+                mp_idx = item[0]
                 if mp_idx in self.joint_map:
                     s_idx = self.joint_map[mp_idx]
-                    smpl_indices_list.append(s_idx)
-                    target_coords_list.append([x, y, z])
-                    match_count += 1
+                    s_indices.append(s_idx)
+                    t_3d.append([item[1], item[2], item[3]])
+                    # Convert Norm 2D -> Pixel 2D
+                    t_2d.append([item[4] * width, item[5] * height])
+                    vis.append(item[6]) # Visibility score
                     
-                    # Collect hips (SMPL 1 and 2) for smart init
+                    # Store Hips for init
                     if s_idx == 1 or s_idx == 2:
-                        hip_targets.append([x, y, z])
-            
-            if len(smpl_indices_list) > 0:
-                smpl_joint_indices = torch.tensor(smpl_indices_list, dtype=torch.long, device=self.device)
-                target_joint_coords = torch.tensor(target_coords_list, dtype=torch.float32, device=self.device)
-                has_joints = True
-        
-        if match_count < 3 and keypoints_3d:
-             pass
+                        hip_targets.append([item[1], item[2], item[3]])
+                    
+                    # Store Torso (Hips + Shoulders) for Rigid Phase
+                    # SMPL: 1,2 (Hips), 16,17 (Shoulders)
+                    if s_idx in [1, 2, 16, 17]:
+                        torso_smpl_indices.append(s_idx)
+                        # We need the index in the *subset* tensor, which is simply 'len(t_3d)-1'
+                        torso_target_indices.append(len(t_3d)-1)
 
-        # 3. Smart Initialization
+            if len(s_indices) > 0:
+                smpl_joint_indices = torch.tensor(s_indices, dtype=torch.long, device=self.device)
+                target_joint_3d = torch.tensor(t_3d, dtype=torch.float32, device=self.device)
+                target_joint_2d = torch.tensor(t_2d, dtype=torch.float32, device=self.device)
+                joint_confidence = torch.tensor(vis, dtype=torch.float32, device=self.device).unsqueeze(1)
+                has_joints = True
+
+        # 3. Smart Initialization (Soft Anchor)
         if len(hip_targets) > 0:
             hip_center = np.mean(hip_targets, axis=0)
             hip_center_tensor = torch.tensor(hip_center, dtype=torch.float32, device=self.device)
-            
-            # If not initialized, or if optimization drifted too far (optional check), reset
             if not self.is_initialized:
                 with torch.no_grad():
                     self.transl[:] = hip_center_tensor
-                    # self.transl[0, 1] += 0.0 # Hips are roughly at pelvis center
                 self.is_initialized = True
-                current_iters = 30
             else:
-                # Soft Anchor: Gently nudge translation to target (30% blend)
-                # This fixes long-term drift without causing high-frequency jitter (Hard Alignment)
                 with torch.no_grad():
                      self.transl[:] = self.transl * 0.7 + hip_center_tensor * 0.3
-                current_iters = iterations
-        else:
-            # Fallback to centroid if no hips detected
-            if not self.is_initialized:
-                centroid = torch.mean(target_tensor, dim=0)
-                with torch.no_grad():
-                    self.transl[:] = centroid
-                    self.transl[0, 1] += 0.2 
-                self.is_initialized = True
-                current_iters = 30
-            else:
-                current_iters = iterations
 
-        # 4. Optimization loop
+        # 4. Optimization Strategy
+        if has_joints and len(torso_smpl_indices) >= 2:
+             rigid_optimizer = torch.optim.Adam([self.transl, self.global_orient], lr=0.05)
+             
+             t_torso_idxs = torch.tensor(torso_target_indices, dtype=torch.long, device=self.device)
+             
+             for _ in range(5):
+                 rigid_optimizer.zero_grad()
+                 output = self.model(
+                     betas=self.betas.detach(),
+                     body_pose=self.body_pose.detach(), # Frozen
+                     global_orient=self.global_orient,
+                     transl=self.transl
+                 )
+                 joints = output.joints[0]
+                 
+                 # Only match torso joints in 3D
+                 curr_torso = joints[torch.tensor(torso_smpl_indices, device=self.device)]
+                 targ_torso = target_joint_3d[t_torso_idxs]
+                 
+                 loss_rigid = torch.nn.functional.mse_loss(curr_torso, targ_torso)
+                 loss_rigid.backward()
+                 rigid_optimizer.step()
+
+        # Phase 2: Full Articulation (Hybrid Loss)
         optimizer = torch.optim.Adam([self.transl, self.global_orient, self.betas, self.body_pose], lr=0.02)
+        
+        intr_tensor = None
+        if intrinsics:
+            # Extract [fx, fy, cx, cy]
+            intr_tensor = torch.tensor(intrinsics[0:4], dtype=torch.float32, device=self.device)
 
-        for i in range(current_iters):
+        for i in range(iterations):
             optimizer.zero_grad()
             
-            # return_joints=True
             output = self.model(
                 betas=self.betas, global_orient=self.global_orient,
                 body_pose=self.body_pose, transl=self.transl,
                 return_verts=True
             )
             vertices = output.vertices[0]
-            joints = output.joints[0] # SMPL joints
+            joints = output.joints[0]
             
-            # Loss 1: Point cloud fitting (Scan-to-Mesh)
+            # Loss 1: Scan-to-Mesh (PCD)
             diff = target_tensor.unsqueeze(1) - vertices.unsqueeze(0)
-            # Random sampling for acceleration
             if vertices.shape[0] > 1000:
                  v_indices = torch.randperm(vertices.shape[0])[:1000]
                  diff = diff[:, v_indices, :]
-            
             dist_sq = (diff ** 2).sum(-1)
             loss_fitting = torch.mean(torch.min(dist_sq, dim=1)[0])
             
-            # Loss 2: Joint anchor loss
-            loss_joints = torch.tensor(0.0, device=self.device)
-            if has_joints:
-                current_joints_subset = joints[smpl_joint_indices]
-                loss_joints = torch.nn.functional.mse_loss(current_joints_subset, target_joint_coords)
+            loss_joints_3d = torch.tensor(0.0, device=self.device)
+            loss_joints_2d = torch.tensor(0.0, device=self.device)
             
+            if has_joints:
+                # 3D Joint Loss (Weighted by confidence)
+                curr_joints = joints[smpl_joint_indices]
+                dist_3d = (curr_joints - target_joint_3d) ** 2
+                loss_joints_3d = torch.mean(dist_3d * joint_confidence)
+                
+                # 2D Reprojection Loss (The FrankMocap Special)
+                if intr_tensor is not None:
+                    proj_2d = self.project_points(curr_joints, intr_tensor)
+                    dist_2d = (proj_2d - target_joint_2d) ** 2
+                    # Pixel coordinates are large (e.g. 500px), MSE will be huge (250000).
+                    # Normalize or scale down. Let's scale down by 1e-4.
+                    loss_joints_2d = torch.mean(dist_2d * joint_confidence) * 1e-4
+
             # Loss 3: Regularization
             loss_pose = torch.mean(self.body_pose ** 2)
             loss_shape = torch.mean(self.betas ** 2)
             
-            # Weight allocation:
-            loss = loss_fitting * 20.0 + loss_joints * 500.0 + loss_pose * 0.1 + loss_shape * 1.0
+            # Loss 4: Motion Smoothness
+            loss_smooth = torch.tensor(0.0, device=self.device)
+            if self.prev_pose is not None:
+                pose_diff = torch.mean((self.body_pose - self.prev_pose) ** 2)
+                transl_diff = torch.mean((self.transl - self.prev_transl) ** 2)
+                orient_diff = torch.mean((self.global_orient - self.prev_orient) ** 2)
+                loss_smooth = (pose_diff + transl_diff + orient_diff)
+
+            # Hybrid Weights
+            # 3D Joints: 500.0 (Strong depth constraint)
+            # 2D Joints: 50.0 (Strong visual lock, but 3D is primary for depth)
+            # Fitting: 20.0 (Surface detail)
+            # Pose: 0.1 (Regularization, reduced to allow movement)
+            # Smooth: 5.0 (Penalize jitter)
+            loss = (loss_fitting * 20.0 + 
+                    loss_joints_3d * 500.0 + 
+                    loss_joints_2d * 50.0 + 
+                    loss_pose * 0.1 + 
+                    loss_shape * 1.0 +
+                    loss_smooth * 5.0)
             
             loss.backward()
             optimizer.step()
+
+        # Save current state for next frame smoothness
+        with torch.no_grad():
+            self.prev_pose = self.body_pose.detach().clone()
+            self.prev_betas = self.betas.detach().clone()
+            self.prev_transl = self.transl.detach().clone()
+            self.prev_orient = self.global_orient.detach().clone()
 
         with torch.no_grad():
             output = self.model(
