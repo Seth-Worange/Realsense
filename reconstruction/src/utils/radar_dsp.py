@@ -1,3 +1,14 @@
+'''
+Author: Orange
+Date: 2026-02-27 10:51
+LastEditors: Orange
+LastEditTime: 2026-02-27 16:03
+FilePath: radar_dsp.py
+Description: 
+    Radar DSP: Process radar data and extract point clouds
+'''
+
+
 import numpy as np
 from scipy.signal import convolve2d
 from .radar_config import RadarConfig

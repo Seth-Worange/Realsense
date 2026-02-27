@@ -1,3 +1,15 @@
+'''
+Author: Orange
+Date: 2026-02-27 10:42
+LastEditors: Orange
+LastEditTime: 2026-02-27 16:03
+FilePath: realsense.py
+Description: 
+    RealSense Processor: Capture frames and generate point clouds
+    MediaPipe version: 0.10.31
+'''
+
+
 import pyrealsense2 as rs
 import numpy as np
 import cv2

@@ -1,3 +1,13 @@
+'''
+Author: Orange
+Date: 2026-02-27 10:51
+LastEditors: Orange
+LastEditTime: 2026-02-27 16:04
+FilePath: radar_config.py
+Description: 
+    Radar Config: Configuration for radar system
+'''
+
 import numpy as np
 import scipy.constants as const
 
