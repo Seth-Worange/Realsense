@@ -12,47 +12,52 @@ class PCDMode(Enum):
     HUMAN_ONLY = 1  
     BACKGROUND = 2  
 
+from .rs_config import RSConfig
+
 # =========================================
 # RealSenseProcessor
 # Func： Capture frames and generate point clouds
 # =========================================
 class RealSenseProcessor:
-    def __init__(self, width=640, height=480, fps=30):
-        self.width = width
-        self.height = height
-        self.fps = fps
+    def __init__(self, rs_config=None):
+        if rs_config is None:
+            rs_config = RSConfig()
+            
+        self.width = rs_config.width
+        self.height = rs_config.height
+        self.fps = rs_config.fps
         
         # RealSense Pipeline Setup
         self.pipeline = rs.pipeline()
         self.config = rs.config()
-        self.config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
-        self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        self.config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
+        self.config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
         
         self.align = rs.align(rs.stream.color)
         self.profile = None
         self.started = False
         
         self.pinhole_intrinsics = None
-        self.depth_scale = 0.001 
-        self.clip_distance_m = 3.0 
-        self.voxel_size = 0.02
-        self.human_depth_tolerance = 0.7 
-        self.enable_face = True
-        self.enable_hand = True 
+        self.depth_scale = rs_config.depth_scale_default 
+        self.clip_distance_m = rs_config.clip_distance_m 
+        self.voxel_size = rs_config.voxel_size
+        self.human_depth_tolerance = rs_config.human_depth_tolerance 
+        self.enable_face = rs_config.enable_face
+        self.enable_hand = rs_config.enable_hand 
 
         # Hardware Filters
         self.decimation = rs.decimation_filter()
-        self.decimation.set_option(rs.option.filter_magnitude, 1) # 1 = No decimation
+        self.decimation.set_option(rs.option.filter_magnitude, rs_config.decimation_mag) 
         
         self.spatial = rs.spatial_filter()
-        self.spatial.set_option(rs.option.filter_magnitude, 2)
-        self.spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
-        self.spatial.set_option(rs.option.filter_smooth_delta, 20)
-        self.spatial.set_option(rs.option.holes_fill, 0)
+        self.spatial.set_option(rs.option.filter_magnitude, rs_config.spatial_mag)
+        self.spatial.set_option(rs.option.filter_smooth_alpha, rs_config.spatial_smooth_alpha)
+        self.spatial.set_option(rs.option.filter_smooth_delta, rs_config.spatial_smooth_delta)
+        self.spatial.set_option(rs.option.holes_fill, rs_config.spatial_holes_fill)
         
         self.temporal = rs.temporal_filter()
-        self.temporal.set_option(rs.option.filter_smooth_alpha, 0.4)
-        self.temporal.set_option(rs.option.filter_smooth_delta, 20)
+        self.temporal.set_option(rs.option.filter_smooth_alpha, rs_config.temporal_smooth_alpha)
+        self.temporal.set_option(rs.option.filter_smooth_delta, rs_config.temporal_smooth_delta)
         
         self.hole_filling = rs.hole_filling_filter()
 
