@@ -2,7 +2,7 @@
 Author: Orange
 Date: 2026-02-26 16:53
 LastEditors: Orange
-LastEditTime: 2026-02-27 17:48
+LastEditTime: 2026-02-27 18:41
 FilePath: radar_generate.py
 Description: Vectorized simulator for mmWave FMCW Radar Human Echoes
 '''
@@ -52,7 +52,7 @@ def main():
     # 2. 旋转补偿: 假设摄像头和雷达安装在同一物理位置，但雷达具有 15 度的下倾角
     # 雷达低头视物（俯视），意味着为了把相机坐标系对准雷达，我们需要把世界往上抬起
     # 相当于绕 X 轴旋转 +15 度
-    radar_pitch_deg = 15.0 # 雷达下倾对应正向旋转补偿
+    radar_pitch_deg = -15 # 雷达下倾对应正向旋转补偿
     theta_pitch = np.deg2rad(radar_pitch_deg)
     
     # 绕 X 轴旋转矩阵

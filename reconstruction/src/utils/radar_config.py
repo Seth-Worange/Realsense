@@ -2,7 +2,7 @@
 Author: Orange
 Date: 2026-02-27 10:51
 LastEditors: Orange
-LastEditTime: 2026-02-27 17:06
+LastEditTime: 2026-02-27 18:43
 FilePath: radar_config.py
 Description: 
     Radar Config: Configuration for radar system
@@ -15,9 +15,9 @@ class RadarConfig:
     def __init__(self):
         self.c = const.c         # 光速 (m/s)
         self.fc = 60e9           # 载波频率 (Hz)
-        self.K_slope = 200e12    # 调频斜率 (Hz/s), 200MHz/us = 200e6 * 1e6 = 200e12 Hz/s
-        self.B = 3e9             # 扫频带宽 (Hz)
-        self.Tc = self.B / self.K_slope          # 单个 Chirp 扫频时间 (s) = 15us
+        self.K_slope = 75e12    # 调频斜率 (Hz/s)
+        self.B = 6e9             # 扫频带宽 (Hz)
+        self.Tc = 80e-6         # 单个 Chirp 扫频时间 (s)
         self.Fs = 10e6           # 采样率 (Hz) 
         
         self.NumSamples = 256    # 快时间采样点数
