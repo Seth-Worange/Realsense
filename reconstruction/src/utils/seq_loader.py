@@ -16,15 +16,15 @@ import open3d as o3d
 class PointCloudSequencePlayer:
     def __init__(self, seq_dir, fps=10.0):
         """
-        点云序列加载器，专门用于读取一段采集好的连续单帧 PointCloud 并计算物理信息
-        :param seq_dir: 保存有 frame_XXXX.ply 的文件夹绝对或相对路径
+        点云序列加载器，读取连续单帧 PointCloud 并计算物理信息
+        :param seq_dir: frame_XXXX.ply 的路径
         :param fps: 采集该序列时的实际帧率，用于推算 d_time
         """
         self.seq_dir = seq_dir
         self.fps = fps
         self.dt = 1.0 / self.fps if self.fps > 0 else 0.1
         
-        # 查找该目录下所有的 ply 文件并按数字序号排序
+        # 查找该目录下所有的 ply 文件并排序
         search_pattern = os.path.join(self.seq_dir, "*.ply")
         self.frame_paths = sorted(glob.glob(search_pattern))
         
@@ -44,7 +44,7 @@ class PointCloudSequencePlayer:
 
     def load_frame(self, idx):
         """
-        读取特定帧的纯净数据
+        读取特定帧的数据
         :return: (pc_coords, pc_colors)
                  pc_coords: (N, 3) 真实三维坐标距阵 [X, Y, Z]
                  pc_colors: (N, 3) 对应的归一化 RGB [R, G, B]
@@ -69,21 +69,20 @@ class PointCloudSequencePlayer:
 
     def next_frame_with_velocity(self):
         """
-        [雷达仿真核心组件]
-        逐帧向后读取，并利用帧间光流法/质心差分法近似计算当前点云的速度 (velocity) 矩阵。
+        逐帧读取，利用帧间光流法/质心差分法近似计算当前点云的速度 (velocity) 矩阵。
         
-        :return: (pc_coords, velocities, pc_colors)
+        :return: (pc_coords, velocities)
                  velocities 即为雷达探测到的每个反射点的 [vx, vy, vz]
                  如果是最后一段或空序列返回 None
         """
         if self.current_idx >= self.num_frames:
-            return None, None, None
+            return None, None
             
-        pc_coords, pc_colors = self.load_frame(self.current_idx)
+        pc_coords, _ = self.load_frame(self.current_idx)
         
         if pc_coords is None or len(pc_coords) == 0:
             self.current_idx += 1
-            return np.zeros((0,3)), np.zeros((0,3)), np.zeros((0,3))
+            return np.zeros((0,3)), np.zeros((0,3))
             
         N = pc_coords.shape[0]
         velocities = np.zeros((N, 3))
@@ -104,8 +103,8 @@ class PointCloudSequencePlayer:
                 # k=1 表示找最近的1个邻居点
                 [_, idx, dist] = kdtree.search_knn_vector_3d(query_point, 1)
                 
-                # 若最近点距离差异过大 ( > 0.3 米 ) 认为是噪声或新出现的肢体，速度赋 0
-                if dist[0] < 0.3**2: # dist 返回的是距离的平方
+                # 若最近点距离差异过大 ( > 0.5 米 ) 认为是噪声或新出现的肢体，速度赋 0
+                if dist[0] < 0.5**2: # dist 返回的是距离的平方
                     prev_point = self.prev_pc_coords[idx[0]]
                     velocities[i] = (query_point - prev_point) / self.dt
 
@@ -113,23 +112,34 @@ class PointCloudSequencePlayer:
         self.prev_pc_coords = pc_coords
         self.current_idx += 1
         
-        return pc_coords, velocities, pc_colors
+        return pc_coords, velocities
 
     def get_all_as_radar_targets(self, frame_idx, constant_rcs=0.1):
         """
-        快速将指定的帧转化为雷达仿真需要的数据结构 [pc, vel, rcs]
-        便于在 radar_generate.py 中直接替换掉虚拟随机生成假人。
+        转化为[pc, vel, rcs]
         """
         # 保存原始状态以便恢复
         saved_idx = self.current_idx
         saved_prev = self.prev_pc_coords
         
-        # 强制将状态机挪到它的前一帧计算
-        self.current_idx = max(0, frame_idx - 1)
-        self.prev_pc_coords = self.load_frame(self.current_idx)[0] if self.current_idx > 0 else None
-        
-        # 向前步进 1 步并计算 velocity
-        pc, vel, _ = self.next_frame_with_velocity()
+        if frame_idx == 0:
+            # 如果是第 0 帧，它没有前一帧来计算速度。为了信息完整，我们借用第 1 帧算出的速度（假设初速度=第1帧速度）
+            if self.num_frames > 1:
+                self.current_idx = 0
+                self.prev_pc_coords = self.load_frame(0)[0]
+                _, next_vel = self.next_frame_with_velocity() # 这算的是 0->1 的速度
+                
+                # 重新读一回第 0 帧的空间数据
+                pc, _ = self.load_frame(0)
+                vel = next_vel[:len(pc)] if next_vel is not None else np.zeros_like(pc)
+            else:
+                pc, _ = self.load_frame(0)
+                vel = np.zeros_like(pc)
+        else:
+            # 正常情况：计算 frame_idx-1 -> frame_idx 的速度
+            self.current_idx = max(0, frame_idx - 1)
+            self.prev_pc_coords = self.load_frame(self.current_idx)[0] if self.current_idx > 0 else None
+            pc, vel = self.next_frame_with_velocity()
         
         # 恢复状态机
         self.current_idx = saved_idx
