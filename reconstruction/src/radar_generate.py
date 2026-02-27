@@ -2,7 +2,7 @@
 Author: Orange
 Date: 2026-02-26 16:53
 LastEditors: Orange
-LastEditTime: 2026-02-26 18:23
+LastEditTime: 2026-02-27 10:42
 FilePath: radar_generate.py
 Description: Vectorized simulator for mmWave FMCW Radar Human Echoes
 '''
