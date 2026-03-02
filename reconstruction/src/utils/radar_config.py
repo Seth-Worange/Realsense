@@ -25,7 +25,7 @@ class RadarConfig:
         
         # 物理时长与常数
         self.K = self.K_slope    # 调频斜率
-        self.PRT = 50e-6         # 脉冲重复时间 (Chirp 周期)
+        self.PRT = 100e-6         # 脉冲重复时间 (Chirp 周期)
         
         # 虚拟天线阵列配置 (MIMO)
         # 根据用户要求的 4Tx 4Rx，采用 TDM-MIMO 模式产生 16 根虚拟接收天线

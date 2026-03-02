@@ -29,49 +29,30 @@ def simulate_adc(pc, vel, rcs, config: RadarConfig, batch_size=50):
     t_slow = np.arange(config.NumChirps) * config.PRT
     
     # 构建虚拟阵列天线的位置
-    # virtual_pos 维度: (NumTx * NumRx, 3) 
-    # 即对应图示的 0, ω, 2ω, 3ω, 4ω ... (ω=d1=lambda/2)
-    virtual_pos = np.zeros((N_virt, 3))
-    idx = 0
+    # 在进入 batch 循环前，预先构建 Tx 和 Rx 的扩展坐标矩阵
+    tx_arr = np.zeros((N_virt, 3))
+    rx_arr = np.zeros((N_virt, 3))
+    v_idx = 0
     for t in range(config.NumTx):
         for r in range(config.NumRx):
-            # TDM-MIMO 中虚拟阵列位置 = Tx位置 + Rx位置
-            virtual_pos[idx] = config.TxPos[t] + config.RxPos[r]
-            idx += 1
+            tx_arr[v_idx] = config.TxPos[t]
+            rx_arr[v_idx] = config.RxPos[r]
+            v_idx += 1
             
-    # 将海量的点云切成 Batch 计算，避免内存爆炸 (OOM)
+    # 进入 Batch 循环
     for i in range(0, P, batch_size):
         idx_end = min(i + batch_size, P)
-        pb_pc = pc[i:idx_end]    # (PB, 3)
-        pb_vel = vel[i:idx_end]  # (PB, 3)
-        pb_rcs = rcs[i:idx_end]  # (PB,)
+        pb_pc = pc[i:idx_end]    
+        pb_vel = vel[i:idx_end]  
+        pb_rcs = rcs[i:idx_end]  
         
-        # 计算慢时间对应的靶标绝对位置
-        # pos_n 维度: (PB, Nc, 3)
         pos_n = pb_pc[:, None, :] + pb_vel[:, None, :] * t_slow[None, :, None]
         
-        # 在远场近似下，双程距离等于 2 * 中心距离 - (发射天线投影 + 接收天线投影)
-        # 也就是单程距离等效为从 virtual_pos 进行单向收发
-        # R_center: (PB, Nc)
-        
-        # 扩展出 Virtual Array 维度
-        pos_n_virt = pos_n[:, :, None, :] # (PB, Nc, 1, 3)
-        # R_virt: (PB, Nc, N_virt)
-        # 这里计算每个虚拟天线的等效单程 R (假设双程被平分为两个单程以匹配远场近场混杂)
-        # 精确写法： R_total = || Pos - Tx || + || Pos - Rx || 
-        # 为了高效，我们将 virtual_array 的相控效果退化为中心等效：
-        
-        # 严格计算距离
-        R_tx = np.zeros((idx_end - i, config.NumChirps, N_virt))
-        R_rx = np.zeros((idx_end - i, config.NumChirps, N_virt))
-        
-        v_idx = 0
-        for t in range(config.NumTx):
-            for r in range(config.NumRx):
-                # np.linalg.norm: (PB, Nc, 3) -> (PB, Nc)
-                R_tx[:, :, v_idx] = np.linalg.norm(pos_n - config.TxPos[t], axis=-1)
-                R_rx[:, :, v_idx] = np.linalg.norm(pos_n - config.RxPos[r], axis=-1)
-                v_idx += 1
+        # --- 优化点：利用广播一次性计算所有虚拟天线的距离 ---
+        # pos_n 扩展为 (PB, Nc, 1, 3)，与 tx_arr (N_virt, 3) 广播计算
+        pos_n_exp = pos_n[:, :, None, :]
+        R_tx = np.linalg.norm(pos_n_exp - tx_arr, axis=-1)
+        R_rx = np.linalg.norm(pos_n_exp - rx_arr, axis=-1)
                 
         # 计算双程飞行时间 Tau
         tau = (R_tx + R_rx) / config.c # (PB, Nc, N_virt)
@@ -233,9 +214,15 @@ def extract_point_cloud(angle_fft_2d, range_axis, doppler_axis, theta_axis, phi_
         
         # 从极坐标映射回笛卡尔空间 (方位角 Azimuth = theta，俯仰角 Elevation = phi)
         # 约定 Y 为前方深度纵深
-        y = r * np.cos(phi * np.pi / 180) * np.cos(theta * np.pi / 180)
-        x = r * np.cos(phi * np.pi / 180) * np.sin(theta * np.pi / 180)
-        z = r * np.sin(phi * np.pi / 180) # Z 为高度
+        # 直接使用 FFT 解析出的方向余弦
+        u = np.sin(theta * np.pi / 180)
+        v = np.sin(phi * np.pi / 180)
+        
+        x = r * u
+        z = r * v
+        # 防止计算精度导致的负数开根号
+        y_sq = r**2 - x**2 - z**2
+        y = np.sqrt(max(0, y_sq))
         
         pc_radar.append([x, y, z, v, intensity])
         
