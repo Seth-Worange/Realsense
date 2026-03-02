@@ -12,6 +12,7 @@ import os
 import glob
 import numpy as np
 import open3d as o3d
+from scipy.spatial import cKDTree
 
 class PointCloudSequencePlayer:
     def __init__(self, seq_dir, fps=10.0):
@@ -88,25 +89,17 @@ class PointCloudSequencePlayer:
         velocities = np.zeros((N, 3))
         
         if self.prev_pc_coords is not None and len(self.prev_pc_coords) > 0:
-            # 真实情况下，由于点云 N 的数量每一帧是不定长的，且对应顺序随机，
-            # 直接做减法 pc_coords - prev_pc 最多引起维数灾难。
-            # 因此这里用一种巧妙的“最近邻插值假定 (Nearest Neighbor Assumption)”来估算：
-            # 找到当前帧中每个点在上一帧中最靠近的那个“躯干部位点”，认为它是从那里移动过来的。
+            # 使用 SciPy 的 cKDTree 进行向量化批量查询，消灭 for 循环
+            tree = cKDTree(self.prev_pc_coords)
             
-            # 使用 Open3D 的 KDTree 进行极速的欧氏距离查找
-            pcd_prev = o3d.geometry.PointCloud()
-            pcd_prev.points = o3d.utility.Vector3dVector(self.prev_pc_coords)
-            kdtree = o3d.geometry.KDTreeFlann(pcd_prev)
+            # 瞬间完成所有点的最近邻查找
+            distances, indices = tree.query(pc_coords, k=1)
             
-            for i in range(N):
-                query_point = pc_coords[i]
-                # k=1 表示找最近的1个邻居点
-                [_, idx, dist] = kdtree.search_knn_vector_3d(query_point, 1)
-                
-                # 若最近点距离差异过大 ( > 0.5 米 ) 认为是噪声或新出现的肢体，速度赋 0
-                if dist[0] < 0.5**2: # dist 返回的是距离的平方
-                    prev_point = self.prev_pc_coords[idx[0]]
-                    velocities[i] = (query_point - prev_point) / self.dt
+            # 构造有效掩码：cKDTree 返回的是真实距离，不是距离平方
+            valid_mask = distances < 0.5  
+            
+            # 矩阵化直接赋值速度
+            velocities[valid_mask] = (pc_coords[valid_mask] - self.prev_pc_coords[indices[valid_mask]]) / self.dt
 
         # 更新状态机
         self.prev_pc_coords = pc_coords

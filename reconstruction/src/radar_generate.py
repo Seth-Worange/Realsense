@@ -73,11 +73,11 @@ def main():
     
     print("运行雷达基带数字信号处理 (DSP)...")
     start_time = time.time()
-    rdm, angle_fft_2d, range_axis, doppler_axis, theta_axis, phi_axis = process_radar_data(adc_cube, config)
+    rdm, az_fft, el_fft, range_axis, doppler_axis, theta_axis, phi_axis = process_radar_data(adc_cube, config)
     print(f" -> 频域 FFT 解析完成, 耗时 {time.time() - start_time:.3f} 秒.")
     
     print("在 Range-Doppler 域截取 CFAR 并解析角度产生雷达点云...")
-    radar_pc = extract_point_cloud(angle_fft_2d, range_axis, doppler_axis, theta_axis, phi_axis, rdm)
+    radar_pc = extract_point_cloud(az_fft, el_fft, range_axis, doppler_axis, theta_axis, phi_axis, rdm)
     print(f" -> 检出 {len(radar_pc)} 个稀疏雷达反射点.")
     
     print("可视化渲染输出...")

@@ -9,3 +9,4 @@ reconstruction/datas/rs_pointcloud/
 reconstruction/datas/
 reconstruction/src/utils/__pycache__/
 .vscode/
+reconstruction/images/

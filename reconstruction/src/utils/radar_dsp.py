@@ -116,46 +116,64 @@ def process_radar_data(adc_cube, config: RadarConfig):
     # 3. 角度域 2D FFT (包含 Tx 和 Rx 合成的复杂面阵)
     d = config.wavelength / 2
     
-    # 建立 8(Azimuth) x 3(Elevation) 的虚拟面阵网格
-    grid = np.zeros((config.NumChirps, 3, 8, config.NumSamples // 2), dtype=np.complex64)
+    # 动态获取网格坐标范围以兼容带有整体偏移量的高程配置
+    vx_list = []
+    vz_list = []
+    for t in range(config.NumTx):
+        for r in range(config.NumRx):
+            vx_list.append(int(round((config.TxPos[t, 0] + config.RxPos[r, 0]) / d)))
+            vz_list.append(int(round((config.TxPos[t, 2] + config.RxPos[r, 2]) / d)))
+            
+    min_vx, max_vx = min(vx_list), max(vx_list)
+    min_vz, max_vz = min(vz_list), max(vz_list)
+    num_vx = max_vx - min_vx + 1
+    num_vz = max_vz - min_vz + 1
+    
+    # 建立动态伸缩的虚拟面阵网格
+    grid = np.zeros((config.NumChirps, num_vz, num_vx, config.NumSamples // 2), dtype=np.complex64)
     
     idx = 0
     for t in range(config.NumTx):
         for r in range(config.NumRx):
-            vx = int(round((config.TxPos[t, 0] + config.RxPos[r, 0]) / d))
-            vz = int(round((config.TxPos[t, 2] + config.RxPos[r, 2]) / d))
+            vx = int(round((config.TxPos[t, 0] + config.RxPos[r, 0]) / d)) - min_vx
+            vz = int(round((config.TxPos[t, 2] + config.RxPos[r, 2]) / d)) - min_vz
             grid[:, vz, vx, :] = doppler_fft[:, idx, :]
             idx += 1
             
-    # 空间域加窗
-    win_az = np.hanning(8)
-    win_el = np.hanning(3)
-    grid_w = grid * win_el[None, :, None, None] * win_az[None, None, :, None]
-    
+    # --- 修改部分：解耦的 1D 角度 FFT ---
     N_az = 64
     N_el = 64
-    angle_fft_2d = np.fft.fftshift(np.fft.fft2(grid_w, s=(N_el, N_az), axes=(1, 2)), axes=(1, 2))
     
-    # 计算方位角与俯仰角物理坐标轴
+    # 1. 提取水平方向阵列 (水平截面) 进行方位角估计
+    az_data = grid[:, 0, :, :] # 取底层水平阵元列 (NumChirps, num_vx, NumSamples//2)
+    win_az = np.hanning(num_vx)
+    az_data_w = az_data * win_az[None, :, None]
+    az_fft = np.fft.fftshift(np.fft.fft(az_data_w, n=N_az, axis=1), axes=1)
+    
+    # 2. 提取垂直方向阵列 进行俯仰角估计 (自动搜寻有最多垂直跨度的阵元列)
+    col_has_signal = np.sum(np.abs(grid), axis=(0, 3)) > 0
+    best_vx = np.argmax(np.sum(col_has_signal, axis=0))
+    
+    el_data = grid[:, :, best_vx, :] # (NumChirps, num_vz, NumSamples//2)
+    win_el = np.hanning(num_vz)
+    el_data_w = el_data * win_el[None, :, None]
+    el_fft = np.fft.fftshift(np.fft.fft(el_data_w, n=N_el, axis=1), axes=1)
+    
+    # 计算物理坐标轴
     az_freqs = np.fft.fftshift(np.fft.fftfreq(N_az, d=1.0))
     el_freqs = np.fft.fftshift(np.fft.fftfreq(N_el, d=1.0))
     
-    # 根据傅里叶变换的相移方向，我们需要加上负系数对应到实际物理空间
-    # exp(-j * 2 * pi * f * m)
     sin_theta = -2 * az_freqs
-    valid_theta = np.abs(sin_theta) <= 1.0
-    theta_axis = np.full(N_az, np.nan)
-    theta_axis[valid_theta] = np.arcsin(sin_theta[valid_theta]) * 180 / np.pi
+    theta_axis = np.where(np.abs(sin_theta) <= 1.0, np.arcsin(sin_theta) * 180 / np.pi, np.nan)
     
     sin_phi = -2 * el_freqs
-    valid_phi = np.abs(sin_phi) <= 1.0
-    phi_axis = np.full(N_el, np.nan)
-    phi_axis[valid_phi] = np.arcsin(sin_phi[valid_phi]) * 180 / np.pi
+    phi_axis = np.where(np.abs(sin_phi) <= 1.0, np.arcsin(sin_phi) * 180 / np.pi, np.nan)
     
     # 聚合获得 距离-多普勒 雷达图 (Range-Doppler Map)
     rdm = np.mean(np.abs(doppler_fft), axis=1)
     
-    return rdm, angle_fft_2d, range_axis, doppler_axis, theta_axis, phi_axis
+    # 返回分离的 az_fft 和 el_fft
+    return rdm, az_fft, el_fft, range_axis, doppler_axis, theta_axis, phi_axis
 
 def ca_cfar_2d(rdm, guard_cells=(2, 2), train_cells=(4, 4), pfa=1e-5):
     """
@@ -189,9 +207,9 @@ def ca_cfar_2d(rdm, guard_cells=(2, 2), train_cells=(4, 4), pfa=1e-5):
     
     return mask
 
-def extract_point_cloud(angle_fft_2d, range_axis, doppler_axis, theta_axis, phi_axis, rdm):
+def extract_point_cloud(az_fft, el_fft, range_axis, doppler_axis, theta_axis, phi_axis, rdm):
     """
-    通过二维 CFAR 和 2D 角度 FFT 的极值寻优抽取 3D 雷达点云 (包含高度)
+    通过二维 CFAR 和 1D 角度解耦 FFT 的极值寻优抽取 3D 雷达点云 (包含高度)
     """
     cfar_mask = ca_cfar_2d(rdm)
     doppler_idx, range_idx = np.where(cfar_mask)
@@ -199,8 +217,12 @@ def extract_point_cloud(angle_fft_2d, range_axis, doppler_axis, theta_axis, phi_
     pc_radar = []
     
     for d_idx, r_idx in zip(doppler_idx, range_idx):
-        angle_profile = np.abs(angle_fft_2d[d_idx, :, :, r_idx]) # (N_el, N_az)
-        el_idx, az_idx = np.unravel_index(np.argmax(angle_profile), angle_profile.shape)
+        # 独立寻优方位角和俯仰角
+        az_profile = np.abs(az_fft[d_idx, :, r_idx]) 
+        el_profile = np.abs(el_fft[d_idx, :, r_idx]) 
+        
+        az_idx = np.argmax(az_profile)
+        el_idx = np.argmax(el_profile)
         
         theta = theta_axis[az_idx]
         phi = phi_axis[el_idx]
@@ -212,15 +234,14 @@ def extract_point_cloud(angle_fft_2d, range_axis, doppler_axis, theta_axis, phi_
         r = range_axis[r_idx]
         intensity = rdm[d_idx, r_idx]
         
-        # 从极坐标映射回笛卡尔空间 (方位角 Azimuth = theta，俯仰角 Elevation = phi)
-        # 约定 Y 为前方深度纵深
-        # 直接使用 FFT 解析出的方向余弦
+        # --- 修改部分：基于方向余弦的精确笛卡尔映射 ---
         u = np.sin(theta * np.pi / 180)
-        v = np.sin(phi * np.pi / 180)
+        v_dir = np.sin(phi * np.pi / 180)
         
         x = r * u
-        z = r * v
-        # 防止计算精度导致的负数开根号
+        z = r * v_dir
+        
+        # 保证根号内不为负，计算纵深 Y
         y_sq = r**2 - x**2 - z**2
         y = np.sqrt(max(0, y_sq))
         

@@ -48,4 +48,7 @@ class RadarConfig:
         
         # 接收天线 (Rx) 排布: 间隔为 d 均匀排布于 X 轴
         self.RxPos = np.zeros((self.NumRx, 3))
-        self.RxPos[:, 0] = np.arange(self.NumRx) * d
+        self.RxPos[0] = [0, 0, 3*d]
+        self.RxPos[1] = [d, 0, 3*d]
+        self.RxPos[2] = [2 * d, 0, 3*d]
+        self.RxPos[3] = [3 * d, 0, 3*d]
