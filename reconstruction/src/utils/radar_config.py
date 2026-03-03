@@ -14,13 +14,13 @@ import scipy.constants as const
 class RadarConfig:
     def __init__(self):
         self.c = const.c         # 光速 (m/s)
-        self.fc = 60e9           # 载波频率 (Hz)
+        self.fc = 61.5e9         # 载波频率 (Hz)
         self.K_slope = 75e12    # 调频斜率 (Hz/s)
         self.B = 6e9             # 扫频带宽 (Hz)
         self.Tc = 80e-6         # 单个 Chirp 扫频时间 (s)
         self.Fs = 10e6           # 采样率 (Hz) 
         
-        self.NumSamples = 256    # 快时间采样点数
+        self.NumSamples = 128    # 快时间采样点数
         self.NumChirps = 128     # 慢时间 Chirp 数
         
         # 物理时长与常数
