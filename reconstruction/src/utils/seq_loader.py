@@ -17,9 +17,9 @@ from scipy.spatial import cKDTree
 class PointCloudSequencePlayer:
     def __init__(self, seq_dir, fps=10.0):
         """
-        点云序列加载器，读取连续单帧 PointCloud 并计算物理信息
-        :param seq_dir: frame_XXXX.ply 的路径
-        :param fps: 采集该序列时的实际帧率，用于推算 d_time
+        Point Cloud Sequence Player
+        :param seq_dir: frame_XXXX.ply 
+        :param fps: frame per second
         """
         self.seq_dir = seq_dir
         self.fps = fps
@@ -45,10 +45,10 @@ class PointCloudSequencePlayer:
 
     def load_frame(self, idx):
         """
-        读取特定帧的数据
+        Load specific frame data
         :return: (pc_coords, pc_colors)
-                 pc_coords: (N, 3) 真实三维坐标距阵 [X, Y, Z]
-                 pc_colors: (N, 3) 对应的归一化 RGB [R, G, B]
+                 pc_coords: (N, 3) real 3D coordinates matrix [X, Y, Z]
+                 pc_colors: (N, 3) normalized RGB [R, G, B]
         """
         if idx < 0 or idx >= self.num_frames:
             return None, None
@@ -89,19 +89,19 @@ class PointCloudSequencePlayer:
         velocities = np.zeros((N, 3))
         
         if self.prev_pc_coords is not None and len(self.prev_pc_coords) > 0:
-            # 使用 SciPy 的 cKDTree 进行向量化批量查询，消灭 for 循环
+            # Use SciPy's cKDTree for vectorized batch query
             tree = cKDTree(self.prev_pc_coords)
             
-            # 瞬间完成所有点的最近邻查找
+            # find nearest neighbors
             distances, indices = tree.query(pc_coords, k=1)
             
-            # 构造有效掩码：cKDTree 返回的是真实距离，不是距离平方
+            # Construct valid mask: cKDTree returns true distance, not squared distance
             valid_mask = distances < 0.5  
             
-            # 矩阵化直接赋值速度
+            # Matrix assignment of velocity
             velocities[valid_mask] = (pc_coords[valid_mask] - self.prev_pc_coords[indices[valid_mask]]) / self.dt
 
-        # 更新状态机
+        # Update state machine
         self.prev_pc_coords = pc_coords
         self.current_idx += 1
         

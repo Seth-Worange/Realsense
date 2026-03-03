@@ -17,15 +17,16 @@ from utils.radar_config import RadarConfig
 from utils.radar_dsp import simulate_adc, process_radar_data, ca_cfar_2d, extract_point_cloud
 
 def main():
-    print("初始化雷达配置参数...")
+    print("初始化雷达配置参数")
     config = RadarConfig()
 
-    # 读取您的连拍数据集绝对路径，避免因为执行目录不同导致找不到文件
+    # Read point cloud sequence from RealSense
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     seq_path = os.path.join(base_dir, "datas", "rs_pointcloud", "seq_20260227_150659")
     player = PointCloudSequencePlayer(seq_path, fps=6.0)
     
-    # 例如我们想抽取第 50 帧时那个正在挥手的瞬间，直接送入雷达核心进行干涉探测
+    # Read point cloud at target frame
+    print("读取RS点云数据")
     target_frame = 50
     pc, vel, rcs = player.get_all_as_radar_targets(frame_idx=target_frame)
     
@@ -34,11 +35,11 @@ def main():
         return
     
     # ----------------------------------------------------
-    # 空间系矫正变换 (Coordinate Transformation)
+    # Space coordinate transformation
     # ----------------------------------------------------
-    # 1. 坐标轴重新映射 (Axis Swapping)
-    # RealSense 坐标系: X向右, Y向下, Z向前(深度)
-    # 雷达约定坐标系: X向右(方位角), Y向前(深度), Z向上(俯仰角)
+    # 1. Axis swapping
+    # RealSense coordinate: X right, Y down, Z forward (depth)
+    # Radar coordinate: X right (azimuth), Y forward (depth), Z up (elevation)
     pc_radar_frame = np.zeros_like(pc)
     pc_radar_frame[:, 0] = pc[:, 0]    # Radar X = RS X
     pc_radar_frame[:, 1] = pc[:, 2]    # Radar Y = RS Z
@@ -49,13 +50,11 @@ def main():
     vel_radar_frame[:, 1] = vel[:, 2]
     vel_radar_frame[:, 2] = -vel[:, 1]
     
-    # 2. 旋转补偿: 假设摄像头和雷达安装在同一物理位置，但雷达具有 15 度的下倾角
-    # 雷达低头视物（俯视），意味着为了把相机坐标系对准雷达，我们需要把世界往上抬起
-    # 相当于绕 X 轴旋转 +15 度
-    radar_pitch_deg = 0 # 调试时先设为 0，确认基准对齐后再加入实际安装偏差
+    # 2. Rotation compensation
+    radar_pitch_deg = 0 
     theta_pitch = np.deg2rad(radar_pitch_deg)
     
-    # 绕 X 轴旋转矩阵
+    # X-axis rotation matrix
     R_x = np.array([
         [1, 0, 0],
         [0, np.cos(theta_pitch), -np.sin(theta_pitch)],

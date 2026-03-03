@@ -175,7 +175,7 @@ def process_radar_data(adc_cube, config: RadarConfig):
     # 返回分离的 az_fft 和 el_fft
     return rdm, az_fft, el_fft, range_axis, doppler_axis, theta_axis, phi_axis
 
-def ca_cfar_2d(rdm, guard_cells=(2, 2), train_cells=(4, 4), pfa=1e-5):
+def ca_cfar_2d(rdm, guard_cells=(2, 2), train_cells=(4, 4), pfa=1e-3):
     """
     二维细胞平均恒虚警率检测 (2D CA-CFAR) 
     使用 2D 卷积极速提升计算效率
@@ -202,7 +202,7 @@ def ca_cfar_2d(rdm, guard_cells=(2, 2), train_cells=(4, 4), pfa=1e-5):
     threshold = alpha * noise_level
     
     # 加入基础能量下界，只检测超过本底噪声的峰值
-    min_power = np.max(rdm_sq) * 1e-4 
+    min_power = np.max(rdm_sq) * 1e-5 
     mask = (rdm_sq > threshold) & (rdm_sq > min_power)
     
     return mask
@@ -225,7 +225,7 @@ def extract_point_cloud(az_fft, el_fft, range_axis, doppler_axis, theta_axis, ph
         el_idx = np.argmax(el_profile)
         
         # 峰值有效性检测: 当频谱近似平坦时，该维度无角度分辨力，默认 boresight (0°)
-        PEAK_RATIO_THRESHOLD = 1.5
+        PEAK_RATIO_THRESHOLD = 1.2
         
         az_mean = np.mean(az_profile)
         if az_mean > 0 and az_profile[az_idx] / az_mean > PEAK_RATIO_THRESHOLD:
