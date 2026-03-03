@@ -130,8 +130,8 @@ class PointCloudSequencePlayer:
                 vel = np.zeros_like(pc)
         else:
             # 正常情况：计算 frame_idx-1 -> frame_idx 的速度
-            self.current_idx = max(0, frame_idx - 1)
-            self.prev_pc_coords = self.load_frame(self.current_idx)[0] if self.current_idx > 0 else None
+            self.current_idx = frame_idx                          # 直接指向目标帧
+            self.prev_pc_coords = self.load_frame(frame_idx - 1)[0]  # 前一帧始终存在(frame_idx >= 1)
             pc, vel = self.next_frame_with_velocity()
         
         # 恢复状态机

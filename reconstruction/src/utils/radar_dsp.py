@@ -2,7 +2,7 @@
 Author: Orange
 Date: 2026-02-27 10:51
 LastEditors: Orange
-LastEditTime: 2026-02-27 16:59
+LastEditTime: 2026-03-03 14:14
 FilePath: radar_dsp.py
 Description: 
     Radar DSP: Process radar data and extract point clouds
@@ -23,7 +23,7 @@ def simulate_adc(pc, vel, rcs, config: RadarConfig, batch_size=50):
     # 为了简化且等效，这里我们直接生成一个大小为 NumChirps x (NumTx * NumRx) 的虚拟矩阵
     # 物理意义上相当于雷达硬件完成了 TDM 合并，直接提取出虚拟阵列
     N_virt = config.NumTx * config.NumRx
-    adc_cube = np.zeros((config.NumChirps, N_virt, config.NumSamples), dtype=np.complex64)
+    adc_cube = np.zeros((config.NumChirps, N_virt, config.NumSamples), dtype=np.complex128)
     
     t_fast = np.arange(config.NumSamples) / config.Fs
     t_slow = np.arange(config.NumChirps) * config.PRT
@@ -62,9 +62,9 @@ def simulate_adc(pc, vel, rcs, config: RadarConfig, batch_size=50):
                              config.K * tau[:, :, :, None] * t_fast[None, None, None, :])
         
         # 根据雷达方程计算接收振幅 A ~ RCS / R^4，由于幅值是电压所以开方 -> sqrt(RCS)/R^2
-        R_tot = R_tx + R_rx
-        R_tot = np.clip(R_tot, 0.1, None) # 避免由于距离为 0 引起的除 0 错误
-        amp = np.sqrt(pb_rcs)[:, None, None] / (R_tot ** 2)
+        R_tx_clip = np.clip(R_tx, 0.1, None)
+        R_rx_clip = np.clip(R_rx, 0.1, None)
+        amp = np.sqrt(pb_rcs)[:, None, None] / (R_tx_clip ** 2 * R_rx_clip ** 2)
         
         # 生成复基带 IF 信号：
         signal = amp[:, :, :, None] * np.exp(1j * phase)
@@ -130,7 +130,7 @@ def process_radar_data(adc_cube, config: RadarConfig):
     num_vz = max_vz - min_vz + 1
     
     # 建立动态伸缩的虚拟面阵网格
-    grid = np.zeros((config.NumChirps, num_vz, num_vx, config.NumSamples // 2), dtype=np.complex64)
+    grid = np.zeros((config.NumChirps, num_vz, num_vx, config.NumSamples // 2), dtype=np.complex128)
     
     idx = 0
     for t in range(config.NumTx):
@@ -224,8 +224,20 @@ def extract_point_cloud(az_fft, el_fft, range_axis, doppler_axis, theta_axis, ph
         az_idx = np.argmax(az_profile)
         el_idx = np.argmax(el_profile)
         
-        theta = theta_axis[az_idx]
-        phi = phi_axis[el_idx]
+        # 峰值有效性检测: 当频谱近似平坦时，该维度无角度分辨力，默认 boresight (0°)
+        PEAK_RATIO_THRESHOLD = 1.5
+        
+        az_mean = np.mean(az_profile)
+        if az_mean > 0 and az_profile[az_idx] / az_mean > PEAK_RATIO_THRESHOLD:
+            theta = theta_axis[az_idx]
+        else:
+            theta = 0.0  # 无有效方位角信息，默认 boresight
+            
+        el_mean = np.mean(el_profile)
+        if el_mean > 0 and el_profile[el_idx] / el_mean > PEAK_RATIO_THRESHOLD:
+            phi = phi_axis[el_idx]
+        else:
+            phi = 0.0  # 无有效俯仰角信息，默认 boresight
         
         if np.isnan(theta) or np.isnan(phi):
             continue
@@ -234,16 +246,13 @@ def extract_point_cloud(az_fft, el_fft, range_axis, doppler_axis, theta_axis, ph
         r = range_axis[r_idx]
         intensity = rdm[d_idx, r_idx]
         
-        # --- 修改部分：基于方向余弦的精确笛卡尔映射 ---
-        u = np.sin(theta * np.pi / 180)
-        v_dir = np.sin(phi * np.pi / 180)
+        # --- 显式球坐标 -> 笛卡尔映射 ---
+        theta_rad = np.deg2rad(theta)
+        phi_rad = np.deg2rad(phi)
         
-        x = r * u
-        z = r * v_dir
-        
-        # 保证根号内不为负，计算纵深 Y
-        y_sq = r**2 - x**2 - z**2
-        y = np.sqrt(max(0, y_sq))
+        x = r * np.cos(phi_rad) * np.sin(theta_rad)   # 方位方向
+        y = r * np.cos(phi_rad) * np.cos(theta_rad)   # 纵深方向
+        z = r * np.sin(phi_rad)                        # 高度方向
         
         pc_radar.append([x, y, z, v, intensity])
         
