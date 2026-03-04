@@ -10,7 +10,7 @@ Description:
 
 
 import numpy as np
-from scipy.signal import convolve2d
+from scipy.ndimage import percentile_filter
 from .radar_config import RadarConfig
 
 def simulate_adc(pc, vel, rcs, config: RadarConfig, batch_size=50):
@@ -240,33 +240,34 @@ def capon_beamforming(data_vector, element_positions, scan_angles_deg, diag_load
     
     return theta_est, spectrum
 
-def ca_cfar_2d(rdm, threshold_db=10.0, **kwargs):
+def ca_cfar_2d(rdm, guard_cells=(2, 2), train_cells=(8, 8), pfa=1e-3):
     """
-    噪声自适应阈值检测，替代传统 CA-CFAR
+    OS-CFAR (Ordered Statistics CFAR)
     
-    CA-CFAR 对人体等扩展目标存在严重的"目标遮蔽"效应：
-    多个目标 bin 互相靠近时，训练单元中的目标能量抬高了噪声估计，
-    导致阈值虚高，大量真实目标被漏检。
-    
-    本方法使用全局中位数估计噪声底，再加上固定 dB 门限进行检测。
-    对于人体室内场景更为可靠。
-    
-    Parameters
-    ----------
-    rdm : ndarray
-        Range-Doppler Map
-    threshold_db : float
-        检测门限，高于噪声底多少 dB 判为目标（默认 10dB）
+    使用训练窗口内的第 75 百分位值作为噪声估计。
+    即使窗口中 25% 的单元被目标污染，噪声估计仍然准确，
+    从而解决了传统 CA-CFAR 对扩展目标的遮蔽问题。
     """
+    gr, gc = guard_cells
+    tr, tc = train_cells
+    
     rdm_sq = rdm ** 2
     
-    # 使用中位数作为噪声底估计（对目标占比 < 50% 的场景鲁棒）
-    noise_floor = np.median(rdm_sq)
+    # OS-CFAR: 用大窗口 75th 百分位作为鲁棒噪声估计
+    win_r = 2 * (gr + tr) + 1
+    win_c = 2 * (gc + tc) + 1
+    noise_est = percentile_filter(rdm_sq, percentile=75, size=(win_r, win_c))
     
-    # 转换 dB 门限为线性乘子
-    threshold = noise_floor * (10 ** (threshold_db / 10.0))
+    # 阈值乘子 (从 pfa 推导)
+    N_train = win_r * win_c - (2*gr+1) * (2*gc+1)
+    alpha = N_train * (pfa ** (-1.0 / max(N_train, 1)) - 1)
+    alpha = np.clip(alpha, 3.0, 30.0)
     
-    mask = rdm_sq > threshold
+    threshold = alpha * noise_est
+    
+    # 附加下界: 防止纯噪声区域随机检出
+    min_power = np.max(rdm_sq) * 1e-5
+    mask = (rdm_sq > threshold) & (rdm_sq > min_power)
     
     return mask
 
@@ -340,80 +341,111 @@ def _find_spectrum_peaks(spectrum, scan_angles, peak_ratio=0.3, min_separation_d
 
 def extract_point_cloud(array_info, range_axis, doppler_axis, rdm):
     """
-    通过二维 CFAR + Capon 多峰波束形成 + 邻域扩展 提取 3D 雷达点云
-    支持同一 Range-Doppler bin 的多角度目标提取
+    OS-CFAR 检测 + Capon 波束形成 + 邻域扩展提取 3D 雷达点云
+    
+    - CFAR 检出 bin: 允许多角度提取 (Capon 多峰)
+    - 邻域扩展 bin: 仅取最强单峰 (避免噪声虚假角度)
+    - 所有 bin 的 Capon 峰值须通过信号质量验证
     """
     grid = array_info['grid']
     az_indices = array_info['az_indices']
     el_indices = array_info['el_indices']
     best_vx_col = array_info['best_vx_col']
     
-    # Capon 角度扫描网格
-    az_scan = np.linspace(-60, 60, 121)   # 方位角: -60° ~ +60°, 1°步长
-    el_scan = np.linspace(-45, 45, 91)    # 俯仰角: -45° ~ +45°, 1°步长
-    
-    # 阵元位置 (归一化到 d=λ/2 单位)
+    az_scan = np.linspace(-60, 60, 121)
+    el_scan = np.linspace(-45, 45, 91)
     az_positions = az_indices.astype(float)
     el_positions = el_indices.astype(float)
     
-    # --- CFAR 检测 ---
+    # 信号质量阈值：Capon 谱峰值/均值 > 此值才接受该角度
+    PEAK_SNR_THRESHOLD = 3.0
+    
+    # --- OS-CFAR 检测 ---
     cfar_mask = ca_cfar_2d(rdm)
     doppler_idx, range_idx = np.where(cfar_mask)
     
-    # --- 邻域扩展: 收集 CFAR 检出点周围的高能量 bin ---
+    cfar_bins = set()
+    for d_idx, r_idx in zip(doppler_idx, range_idx):
+        cfar_bins.add((d_idx, r_idx))
+    
+    # --- 邻域扩展（仅围绕 CFAR 检出点） ---
     N_dop, N_rng = rdm.shape
     NEIGHBOR_RADIUS = 2
-    NEIGHBOR_RATIO = 0.4          # 放宽至 40%
+    NEIGHBOR_RATIO = 0.5
     
-    expanded_bins = set()
-    for d_idx, r_idx in zip(doppler_idx, range_idx):
-        expanded_bins.add((d_idx, r_idx))
+    neighbor_bins = set()
+    for d_idx, r_idx in cfar_bins:
         center_power = rdm[d_idx, r_idx] ** 2
-        
         for dd in range(-NEIGHBOR_RADIUS, NEIGHBOR_RADIUS + 1):
             for dr in range(-NEIGHBOR_RADIUS, NEIGHBOR_RADIUS + 1):
                 if dd == 0 and dr == 0:
                     continue
                 nd, nr = d_idx + dd, r_idx + dr
                 if 0 <= nd < N_dop and 0 <= nr < N_rng:
-                    if rdm[nd, nr] ** 2 > center_power * NEIGHBOR_RATIO:
-                        expanded_bins.add((nd, nr))
+                    key = (nd, nr)
+                    if key not in cfar_bins and rdm[nd, nr] ** 2 > center_power * NEIGHBOR_RATIO:
+                        neighbor_bins.add(key)
     
-    # --- 对每个目标 bin 进行 Capon 多峰角度估计 ---
-    pc_radar = []
-    
-    for d_idx, r_idx in expanded_bins:
-        # 提取方位阵元数据
+    # --- 角度估计辅助函数 ---
+    def _estimate_angles(d_idx, r_idx, allow_multi_peak):
         az_data = grid[d_idx, 0, az_indices, r_idx]
-        
-        # 提取俯仰阵元数据
         el_data = grid[d_idx, el_indices, best_vx_col, r_idx]
         
-        # Capon 方位角谱 → 多峰搜索
         _, az_spec = capon_beamforming(az_data, az_positions, az_scan)
-        az_peaks = _find_spectrum_peaks(az_spec, az_scan, peak_ratio=0.3, min_separation_deg=5.0)
-        
-        # Capon 俯仰角谱 → 多峰搜索
         _, el_spec = capon_beamforming(el_data, el_positions, el_scan)
-        el_peaks = _find_spectrum_peaks(el_spec, el_scan, peak_ratio=0.3, min_separation_deg=8.0)
         
+        # 信号质量验证
+        az_snr = np.max(az_spec) / (np.mean(az_spec) + 1e-30)
+        el_snr = np.max(el_spec) / (np.mean(el_spec) + 1e-30)
+        
+        if az_snr < PEAK_SNR_THRESHOLD:
+            az_list = [0.0]
+        elif allow_multi_peak:
+            az_list = _find_spectrum_peaks(az_spec, az_scan, peak_ratio=0.5, min_separation_deg=10.0)
+        else:
+            az_list = [az_scan[np.argmax(az_spec)]]
+        
+        if el_snr < PEAK_SNR_THRESHOLD:
+            el_list = [0.0]
+        elif allow_multi_peak:
+            el_list = _find_spectrum_peaks(el_spec, el_scan, peak_ratio=0.5, min_separation_deg=10.0)
+        else:
+            el_list = [el_scan[np.argmax(el_spec)]]
+        
+        return az_list, el_list
+    
+    pc_radar = []
+    
+    # CFAR 检出 bin → 多角度提取
+    for d_idx, r_idx in cfar_bins:
+        az_peaks, el_peaks = _estimate_angles(d_idx, r_idx, allow_multi_peak=True)
         v = doppler_axis[d_idx]
         r = range_axis[r_idx]
         intensity = rdm[d_idx, r_idx]
         
-        # 对每个 (方位峰, 俯仰峰) 组合生成一个点
         for theta in az_peaks:
             for phi in el_peaks:
                 if np.isnan(theta) or np.isnan(phi):
                     continue
-                
-                theta_rad = np.deg2rad(theta)
-                phi_rad = np.deg2rad(phi)
-                
+                theta_rad, phi_rad = np.deg2rad(theta), np.deg2rad(phi)
                 x = r * np.cos(phi_rad) * np.sin(theta_rad)
                 y = r * np.cos(phi_rad) * np.cos(theta_rad)
                 z = r * np.sin(phi_rad)
-                
                 pc_radar.append([x, y, z, v, intensity])
+    
+    # 邻域扩展 bin → 仅最强单峰
+    for d_idx, r_idx in neighbor_bins:
+        az_peaks, el_peaks = _estimate_angles(d_idx, r_idx, allow_multi_peak=False)
+        v = doppler_axis[d_idx]
+        r = range_axis[r_idx]
+        intensity = rdm[d_idx, r_idx]
+        theta, phi = az_peaks[0], el_peaks[0]
+        if np.isnan(theta) or np.isnan(phi):
+            continue
+        theta_rad, phi_rad = np.deg2rad(theta), np.deg2rad(phi)
+        x = r * np.cos(phi_rad) * np.sin(theta_rad)
+        y = r * np.cos(phi_rad) * np.cos(theta_rad)
+        z = r * np.sin(phi_rad)
+        pc_radar.append([x, y, z, v, intensity])
     
     return np.array(pc_radar) if len(pc_radar) > 0 else np.zeros((0, 5))
