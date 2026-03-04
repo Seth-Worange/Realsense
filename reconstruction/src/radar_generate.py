@@ -2,7 +2,7 @@
 Author: Orange
 Date: 2026-02-26 16:53
 LastEditors: Orange
-LastEditTime: 2026-03-04 11:07
+LastEditTime: 2026-03-04 13:43
 FilePath: radar_generate.py
 Description: Vectorized simulator for mmWave FMCW Radar Human Echoes
 '''
@@ -14,7 +14,7 @@ import os
 
 from utils import PointCloudSequencePlayer
 from utils.radar_config import RadarConfig
-from utils.radar_dsp import simulate_adc, process_radar_data, ca_cfar_2d, extract_point_cloud
+from utils.radar_dsp import simulate_adc, process_radar_data, extract_point_cloud
 
 def main():
     print("初始化雷达配置参数")
@@ -72,11 +72,11 @@ def main():
     
     print("运行雷达基带数字信号处理 (DSP)...")
     start_time = time.time()
-    rdm, az_fft, el_fft, range_axis, doppler_axis, theta_axis, phi_axis = process_radar_data(adc_cube, config)
-    print(f" -> 频域 FFT 解析完成, 耗时 {time.time() - start_time:.3f} 秒.")
+    rdm, array_info, range_axis, doppler_axis = process_radar_data(adc_cube, config)
+    print(f" -> DSP 处理完成, 耗时 {time.time() - start_time:.3f} 秒.")
     
-    print("在 Range-Doppler 域截取 CFAR 并解析角度产生雷达点云...")
-    radar_pc = extract_point_cloud(az_fft, el_fft, range_axis, doppler_axis, theta_axis, phi_axis, rdm)
+    print("在 Range-Doppler 域截取 CFAR 并使用 Capon 波束形成解析角度...")
+    radar_pc = extract_point_cloud(array_info, range_axis, doppler_axis, rdm)
     print(f" -> 检出 {len(radar_pc)} 个稀疏雷达反射点.")
     
     print("可视化渲染输出...")

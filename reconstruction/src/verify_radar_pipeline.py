@@ -46,10 +46,10 @@ def test_single_target(x_gt, y_gt, z_gt, vx=0.0, vy=0.0, vz=0.0, label=""):
     adc_cube = simulate_adc(pc, vel, rcs, config)
     
     # DSP 处理
-    rdm, az_fft, el_fft, range_axis, doppler_axis, theta_axis, phi_axis = process_radar_data(adc_cube, config)
+    rdm, array_info, range_axis, doppler_axis = process_radar_data(adc_cube, config)
     
-    # 提取点云
-    radar_pc = extract_point_cloud(az_fft, el_fft, range_axis, doppler_axis, theta_axis, phi_axis, rdm)
+    # 提取点云 (Capon 波束形成)
+    radar_pc = extract_point_cloud(array_info, range_axis, doppler_axis, rdm)
     
     # 计算真实距离
     r_gt = np.sqrt(x_gt**2 + y_gt**2 + z_gt**2)

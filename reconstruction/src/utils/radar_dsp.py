@@ -2,7 +2,7 @@
 Author: Orange
 Date: 2026-02-27 10:51
 LastEditors: Orange
-LastEditTime: 2026-03-03 14:14
+LastEditTime: 2026-03-04 14:18
 FilePath: radar_dsp.py
 Description: 
     Radar DSP: Process radar data and extract point clouds
@@ -61,10 +61,11 @@ def simulate_adc(pc, vel, rcs, config: RadarConfig, batch_size=50):
         phase = 2 * np.pi * (config.fc * tau[:, :, :, None] + 
                              config.K * tau[:, :, :, None] * t_fast[None, None, None, :])
         
-        # 根据雷达方程计算接收振幅 A ~ RCS / R^4，由于幅值是电压所以开方 -> sqrt(RCS)/R^2
+        # 幅值衰减模型：室内近距 (1-3m) 人体场景采用 1/R² 软化模型
+        # 理论 1/R⁴ 在近距离动态范围过大，导致弱散射点被躯干掩盖
         R_tx_clip = np.clip(R_tx, 0.1, None)
         R_rx_clip = np.clip(R_rx, 0.1, None)
-        amp = np.sqrt(pb_rcs)[:, None, None] / (R_tx_clip ** 2 * R_rx_clip ** 2)
+        amp = np.sqrt(pb_rcs)[:, None, None] / (R_tx_clip * R_rx_clip)
         
         # 生成复基带 IF 信号：
         signal = amp[:, :, :, None] * np.exp(1j * phase)
@@ -92,7 +93,8 @@ def simulate_adc(pc, vel, rcs, config: RadarConfig, batch_size=50):
 
 def process_radar_data(adc_cube, config: RadarConfig):
     """
-    雷达数字信号处理 (DSP) 链路：Range FFT -> Doppler FFT -> Angle FFT
+    雷达数字信号处理 (DSP) 链路：Range FFT -> Doppler FFT -> 构建虚拟阵列网格
+    角度估计由 Capon 波束形成在 extract_point_cloud 中完成
     """
     # 1. 距离域 FFT (快时间)
     win_range = np.hanning(config.NumSamples)
@@ -113,7 +115,7 @@ def process_radar_data(adc_cube, config: RadarConfig):
     slow_freqs = np.fft.fftshift(np.fft.fftfreq(config.NumChirps, d=config.PRT))
     doppler_axis = slow_freqs * config.wavelength / 2
     
-    # 3. 角度域 2D FFT (包含 Tx 和 Rx 合成的复杂面阵)
+    # 3. 构建虚拟天线面阵网格 (用于后续 Capon 波束形成)
     d = config.wavelength / 2
     
     # 动态获取网格坐标范围以兼容带有整体偏移量的高程配置
@@ -132,128 +134,286 @@ def process_radar_data(adc_cube, config: RadarConfig):
     # 建立动态伸缩的虚拟面阵网格
     grid = np.zeros((config.NumChirps, num_vz, num_vx, config.NumSamples // 2), dtype=np.complex128)
     
+    # 记录哪些网格位置有真实天线数据（用于 Capon 稀疏阵列处理）
+    grid_mask = np.zeros((num_vz, num_vx), dtype=bool)
+    
     idx = 0
     for t in range(config.NumTx):
         for r in range(config.NumRx):
             vx = int(round((config.TxPos[t, 0] + config.RxPos[r, 0]) / d)) - min_vx
             vz = int(round((config.TxPos[t, 2] + config.RxPos[r, 2]) / d)) - min_vz
             grid[:, vz, vx, :] = doppler_fft[:, idx, :]
+            grid_mask[vz, vx] = True
             idx += 1
-            
-    # --- 修改部分：解耦的 1D 角度 FFT ---
-    N_az = 64
-    N_el = 64
     
-    # 1. 提取水平方向阵列 (水平截面) 进行方位角估计
-    az_data = grid[:, 0, :, :] # 取底层水平阵元列 (NumChirps, num_vx, NumSamples//2)
-    win_az = np.hanning(num_vx)
-    az_data_w = az_data * win_az[None, :, None]
-    az_fft = np.fft.fftshift(np.fft.fft(az_data_w, n=N_az, axis=1), axes=1)
+    # 提取方位和俯仰方向的有效阵元索引
+    # 方位: 取底层水平行 (vz=0) 中有数据的列索引
+    az_element_indices = np.where(grid_mask[0, :])[0]
     
-    # 2. 提取垂直方向阵列 进行俯仰角估计 (自动搜寻有最多垂直跨度的阵元列)
-    col_has_signal = np.sum(np.abs(grid), axis=(0, 3)) > 0
-    best_vx = np.argmax(np.sum(col_has_signal, axis=0))
-    
-    el_data = grid[:, :, best_vx, :] # (NumChirps, num_vz, NumSamples//2)
-    win_el = np.hanning(num_vz)
-    el_data_w = el_data * win_el[None, :, None]
-    el_fft = np.fft.fftshift(np.fft.fft(el_data_w, n=N_el, axis=1), axes=1)
-    
-    # 计算物理坐标轴
-    az_freqs = np.fft.fftshift(np.fft.fftfreq(N_az, d=1.0))
-    el_freqs = np.fft.fftshift(np.fft.fftfreq(N_el, d=1.0))
-    
-    sin_theta = -2 * az_freqs
-    theta_axis = np.where(np.abs(sin_theta) <= 1.0, np.arcsin(sin_theta) * 180 / np.pi, np.nan)
-    
-    sin_phi = -2 * el_freqs
-    phi_axis = np.where(np.abs(sin_phi) <= 1.0, np.arcsin(sin_phi) * 180 / np.pi, np.nan)
+    # 俯仰: 取纵向阵元最多的列, 提取该列中有数据的行索引
+    col_counts = np.sum(grid_mask, axis=0)
+    best_vx_col = np.argmax(col_counts)
+    el_element_indices = np.where(grid_mask[:, best_vx_col])[0]
     
     # 聚合获得 距离-多普勒 雷达图 (Range-Doppler Map)
     rdm = np.mean(np.abs(doppler_fft), axis=1)
     
-    # 返回分离的 az_fft 和 el_fft
-    return rdm, az_fft, el_fft, range_axis, doppler_axis, theta_axis, phi_axis
+    # 构建返回的阵列元数据
+    array_info = {
+        'grid': grid,
+        'grid_mask': grid_mask,
+        'az_indices': az_element_indices,
+        'el_indices': el_element_indices,
+        'best_vx_col': best_vx_col,
+        'num_vx': num_vx,
+        'num_vz': num_vz,
+    }
+    
+    return rdm, array_info, range_axis, doppler_axis
 
-def ca_cfar_2d(rdm, guard_cells=(2, 2), train_cells=(4, 4), pfa=1e-3):
+
+def capon_beamforming(data_vector, element_positions, scan_angles_deg, diag_load=0.1):
     """
-    二维细胞平均恒虚警率检测 (2D CA-CFAR) 
-    使用 2D 卷积极速提升计算效率
+    Capon (MVDR) 自适应波束形成角度估计
+    
+    Parameters
+    ----------
+    data_vector : ndarray, shape (N_elements,), complex
+        某个 (doppler, range) bin 上各阵元的复数采样值
+    element_positions : ndarray, shape (N_elements,), float
+        阵元在扫描方向上的归一化位置 (以 d=λ/2 为单位)
+    scan_angles_deg : ndarray, shape (N_scan,), float
+        扫描角度网格 (度)
+    diag_load : float
+        对角加载系数 (相对于 trace(R)/N)，增强小阵列鲁棒性
+        
+    Returns
+    -------
+    theta_est : float
+        估计角度 (度)
+    spectrum : ndarray, shape (N_scan,)
+        Capon 空间谱
     """
-    gr, gc = guard_cells
-    tr, tc = train_cells
+    N = len(data_vector)
+    x = data_vector.reshape(N, 1)
     
-    # 构造卷积核
-    kernel_size = (2*(gr+tr)+1, 2*(gc+tc)+1)
-    kernel = np.ones(kernel_size)
+    # 协方差矩阵 (单快拍 + 对角加载)
+    R = x @ x.conj().T
+    load = diag_load * np.trace(R).real / N
+    R += load * np.eye(N)
     
-    # 保护单元与待检测单元(CUT)中心置 0
-    gr_start, gr_end = tr, tr + 2*gr + 1
-    gc_start, gc_end = tc, tc + 2*gc + 1
-    kernel[gr_start:gr_end, gc_start:gc_end] = 0
+    # 求逆 (对于 3~8 阵元的小矩阵，直接 inv 即可)
+    try:
+        R_inv = np.linalg.inv(R)
+    except np.linalg.LinAlgError:
+        # 奇异矩阵 fallback: 返回 0°
+        return 0.0, np.zeros(len(scan_angles_deg))
     
-    N_train = np.sum(kernel)
-    alpha = N_train * (pfa ** (-1.0 / N_train) - 1)
+    # 构建导向矢量矩阵并扫描 Capon 谱
+    scan_rad = np.deg2rad(scan_angles_deg)
+    spectrum = np.zeros(len(scan_angles_deg))
     
-    # 使用卷积获取局部能量积分
+    for i, theta_r in enumerate(scan_rad):
+        # 导向矢量: a(θ) = exp(-j * 2π * d_pos * sin(θ))
+        # element_positions 已归一化为 d=λ/2 单位，空间频率 = sin(θ) / 2
+        a = np.exp(-1j * np.pi * element_positions * np.sin(theta_r)).reshape(N, 1)
+        denom = (a.conj().T @ R_inv @ a).real.item()
+        spectrum[i] = 1.0 / max(denom, 1e-20)
+    
+    # 峰值搜索 + 抛物线插值精化
+    peak_idx = np.argmax(spectrum)
+    
+    if 0 < peak_idx < len(spectrum) - 1:
+        # 对数域抛物线插值
+        y_l = np.log(spectrum[peak_idx - 1] + 1e-30)
+        y_c = np.log(spectrum[peak_idx] + 1e-30)
+        y_r = np.log(spectrum[peak_idx + 1] + 1e-30)
+        denom_interp = 2 * y_c - y_l - y_r
+        if abs(denom_interp) > 1e-12:
+            delta = 0.5 * (y_l - y_r) / denom_interp
+            delta = np.clip(delta, -0.5, 0.5)
+            theta_est = scan_angles_deg[peak_idx] + delta * (scan_angles_deg[1] - scan_angles_deg[0])
+        else:
+            theta_est = scan_angles_deg[peak_idx]
+    else:
+        theta_est = scan_angles_deg[peak_idx]
+    
+    return theta_est, spectrum
+
+def ca_cfar_2d(rdm, threshold_db=10.0, **kwargs):
+    """
+    噪声自适应阈值检测，替代传统 CA-CFAR
+    
+    CA-CFAR 对人体等扩展目标存在严重的"目标遮蔽"效应：
+    多个目标 bin 互相靠近时，训练单元中的目标能量抬高了噪声估计，
+    导致阈值虚高，大量真实目标被漏检。
+    
+    本方法使用全局中位数估计噪声底，再加上固定 dB 门限进行检测。
+    对于人体室内场景更为可靠。
+    
+    Parameters
+    ----------
+    rdm : ndarray
+        Range-Doppler Map
+    threshold_db : float
+        检测门限，高于噪声底多少 dB 判为目标（默认 10dB）
+    """
     rdm_sq = rdm ** 2
-    noise_sum = convolve2d(rdm_sq, kernel, mode='same', boundary='symm')
-    noise_level = noise_sum / N_train
-    threshold = alpha * noise_level
     
-    # 加入基础能量下界，只检测超过本底噪声的峰值
-    min_power = np.max(rdm_sq) * 1e-5 
-    mask = (rdm_sq > threshold) & (rdm_sq > min_power)
+    # 使用中位数作为噪声底估计（对目标占比 < 50% 的场景鲁棒）
+    noise_floor = np.median(rdm_sq)
+    
+    # 转换 dB 门限为线性乘子
+    threshold = noise_floor * (10 ** (threshold_db / 10.0))
+    
+    mask = rdm_sq > threshold
     
     return mask
 
-def extract_point_cloud(az_fft, el_fft, range_axis, doppler_axis, theta_axis, phi_axis, rdm):
+
+def _find_spectrum_peaks(spectrum, scan_angles, peak_ratio=0.3, min_separation_deg=5.0):
     """
-    通过二维 CFAR 和 1D 角度解耦 FFT 的极值寻优抽取 3D 雷达点云 (包含高度)
+    在 Capon 空间谱中搜索所有显著峰值
+    
+    Parameters
+    ----------
+    spectrum : ndarray
+        Capon 空间功率谱
+    scan_angles : ndarray
+        对应角度网格 (度)
+    peak_ratio : float
+        峰值阈值 = 全局最大值 × peak_ratio
+    min_separation_deg : float
+        两个峰值之间的最小角度间隔 (度)
+        
+    Returns
+    -------
+    peaks : list of float
+        所有检出峰值对应的角度 (度)
     """
+    if len(spectrum) < 3:
+        return [scan_angles[np.argmax(spectrum)]]
+    
+    threshold = np.max(spectrum) * peak_ratio
+    step = scan_angles[1] - scan_angles[0] if len(scan_angles) > 1 else 1.0
+    min_sep_bins = max(1, int(min_separation_deg / abs(step)))
+    
+    # 搜索所有局部极大值
+    candidates = []
+    for i in range(1, len(spectrum) - 1):
+        if spectrum[i] > spectrum[i-1] and spectrum[i] > spectrum[i+1] and spectrum[i] > threshold:
+            # 抛物线插值精化
+            y_l = np.log(spectrum[i-1] + 1e-30)
+            y_c = np.log(spectrum[i] + 1e-30)
+            y_r = np.log(spectrum[i+1] + 1e-30)
+            denom = 2 * y_c - y_l - y_r
+            if abs(denom) > 1e-12:
+                delta = 0.5 * (y_l - y_r) / denom
+                delta = np.clip(delta, -0.5, 0.5)
+                angle = scan_angles[i] + delta * step
+            else:
+                angle = scan_angles[i]
+            candidates.append((spectrum[i], angle, i))
+    
+    # 如果没有找到局部极大值，使用全局最大值
+    if not candidates:
+        return [scan_angles[np.argmax(spectrum)]]
+    
+    # 按能量降序排列，贪心选取（NMS 风格）
+    candidates.sort(key=lambda x: -x[0])
+    selected = []
+    used_bins = set()
+    
+    for power, angle, idx in candidates:
+        # 检查是否与已选峰值太近
+        too_close = False
+        for used_idx in used_bins:
+            if abs(idx - used_idx) < min_sep_bins:
+                too_close = True
+                break
+        if not too_close:
+            selected.append(angle)
+            used_bins.add(idx)
+    
+    return selected if selected else [scan_angles[np.argmax(spectrum)]]
+
+
+def extract_point_cloud(array_info, range_axis, doppler_axis, rdm):
+    """
+    通过二维 CFAR + Capon 多峰波束形成 + 邻域扩展 提取 3D 雷达点云
+    支持同一 Range-Doppler bin 的多角度目标提取
+    """
+    grid = array_info['grid']
+    az_indices = array_info['az_indices']
+    el_indices = array_info['el_indices']
+    best_vx_col = array_info['best_vx_col']
+    
+    # Capon 角度扫描网格
+    az_scan = np.linspace(-60, 60, 121)   # 方位角: -60° ~ +60°, 1°步长
+    el_scan = np.linspace(-45, 45, 91)    # 俯仰角: -45° ~ +45°, 1°步长
+    
+    # 阵元位置 (归一化到 d=λ/2 单位)
+    az_positions = az_indices.astype(float)
+    el_positions = el_indices.astype(float)
+    
+    # --- CFAR 检测 ---
     cfar_mask = ca_cfar_2d(rdm)
     doppler_idx, range_idx = np.where(cfar_mask)
     
+    # --- 邻域扩展: 收集 CFAR 检出点周围的高能量 bin ---
+    N_dop, N_rng = rdm.shape
+    NEIGHBOR_RADIUS = 2
+    NEIGHBOR_RATIO = 0.4          # 放宽至 40%
+    
+    expanded_bins = set()
+    for d_idx, r_idx in zip(doppler_idx, range_idx):
+        expanded_bins.add((d_idx, r_idx))
+        center_power = rdm[d_idx, r_idx] ** 2
+        
+        for dd in range(-NEIGHBOR_RADIUS, NEIGHBOR_RADIUS + 1):
+            for dr in range(-NEIGHBOR_RADIUS, NEIGHBOR_RADIUS + 1):
+                if dd == 0 and dr == 0:
+                    continue
+                nd, nr = d_idx + dd, r_idx + dr
+                if 0 <= nd < N_dop and 0 <= nr < N_rng:
+                    if rdm[nd, nr] ** 2 > center_power * NEIGHBOR_RATIO:
+                        expanded_bins.add((nd, nr))
+    
+    # --- 对每个目标 bin 进行 Capon 多峰角度估计 ---
     pc_radar = []
     
-    for d_idx, r_idx in zip(doppler_idx, range_idx):
-        # 独立寻优方位角和俯仰角
-        az_profile = np.abs(az_fft[d_idx, :, r_idx]) 
-        el_profile = np.abs(el_fft[d_idx, :, r_idx]) 
+    for d_idx, r_idx in expanded_bins:
+        # 提取方位阵元数据
+        az_data = grid[d_idx, 0, az_indices, r_idx]
         
-        az_idx = np.argmax(az_profile)
-        el_idx = np.argmax(el_profile)
+        # 提取俯仰阵元数据
+        el_data = grid[d_idx, el_indices, best_vx_col, r_idx]
         
-        # 峰值有效性检测: 当频谱近似平坦时，该维度无角度分辨力，默认 boresight (0°)
-        PEAK_RATIO_THRESHOLD = 1.2
+        # Capon 方位角谱 → 多峰搜索
+        _, az_spec = capon_beamforming(az_data, az_positions, az_scan)
+        az_peaks = _find_spectrum_peaks(az_spec, az_scan, peak_ratio=0.3, min_separation_deg=5.0)
         
-        az_mean = np.mean(az_profile)
-        if az_mean > 0 and az_profile[az_idx] / az_mean > PEAK_RATIO_THRESHOLD:
-            theta = theta_axis[az_idx]
-        else:
-            theta = 0.0  # 无有效方位角信息，默认 boresight
-            
-        el_mean = np.mean(el_profile)
-        if el_mean > 0 and el_profile[el_idx] / el_mean > PEAK_RATIO_THRESHOLD:
-            phi = phi_axis[el_idx]
-        else:
-            phi = 0.0  # 无有效俯仰角信息，默认 boresight
+        # Capon 俯仰角谱 → 多峰搜索
+        _, el_spec = capon_beamforming(el_data, el_positions, el_scan)
+        el_peaks = _find_spectrum_peaks(el_spec, el_scan, peak_ratio=0.3, min_separation_deg=8.0)
         
-        if np.isnan(theta) or np.isnan(phi):
-            continue
-            
         v = doppler_axis[d_idx]
         r = range_axis[r_idx]
         intensity = rdm[d_idx, r_idx]
         
-        # --- 显式球坐标 -> 笛卡尔映射 ---
-        theta_rad = np.deg2rad(theta)
-        phi_rad = np.deg2rad(phi)
-        
-        x = r * np.cos(phi_rad) * np.sin(theta_rad)   # 方位方向
-        y = r * np.cos(phi_rad) * np.cos(theta_rad)   # 纵深方向
-        z = r * np.sin(phi_rad)                        # 高度方向
-        
-        pc_radar.append([x, y, z, v, intensity])
-        
+        # 对每个 (方位峰, 俯仰峰) 组合生成一个点
+        for theta in az_peaks:
+            for phi in el_peaks:
+                if np.isnan(theta) or np.isnan(phi):
+                    continue
+                
+                theta_rad = np.deg2rad(theta)
+                phi_rad = np.deg2rad(phi)
+                
+                x = r * np.cos(phi_rad) * np.sin(theta_rad)
+                y = r * np.cos(phi_rad) * np.cos(theta_rad)
+                z = r * np.sin(phi_rad)
+                
+                pc_radar.append([x, y, z, v, intensity])
+    
     return np.array(pc_radar) if len(pc_radar) > 0 else np.zeros((0, 5))
