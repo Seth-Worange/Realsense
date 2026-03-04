@@ -2,7 +2,7 @@
 Author: Orange
 Date: 2026-02-26 16:53
 LastEditors: Orange
-LastEditTime: 2026-03-03 14:15
+LastEditTime: 2026-03-04 11:07
 FilePath: radar_generate.py
 Description: Vectorized simulator for mmWave FMCW Radar Human Echoes
 '''
@@ -119,7 +119,9 @@ def main():
     ax.view_init(elev=20, azim=-60)
     
     plt.tight_layout()
-    output_path = os.path.join(os.path.dirname(__file__), 'radar_simulation_result.png')
+    current_dir = os.path.dirname(__file__)
+    parent_dir = os.path.dirname(current_dir)
+    output_path = os.path.join(parent_dir, 'images/radar_simulation_result.png')
     plt.savefig(output_path, dpi=300)
     print(f" -> 成功！结果图已存至 {output_path}")
     plt.show()
