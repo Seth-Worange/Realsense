@@ -2,93 +2,136 @@
 Author: Orange
 Date: 2026-02-27 10:51
 LastEditors: Orange
-LastEditTime: 2026-03-04 14:18
+LastEditTime: 2026-03-05 17:50
 FilePath: radar_dsp.py
 Description: 
     Radar DSP: Process radar data and extract point clouds
+    支持 CuPy GPU 加速 (自动检测, 可 fallback 到 NumPy CPU)
 '''
-
 
 import numpy as np
 from scipy.ndimage import percentile_filter
 from .radar_config import RadarConfig
 
-def simulate_adc(pc, vel, rcs, config: RadarConfig, batch_size=50):
+# ------------------------------------------------------------------
+# GPU / CPU 自适应后端
+# 首次调用 simulate_adc 时懒初始化, 避免 import 阶段阻塞
+# ------------------------------------------------------------------
+_xp = None  # 延迟绑定: cupy 或 numpy
+
+def _get_xp():
+    """懒初始化计算后端, 返回 (xp, is_gpu)"""
+    global _xp
+    if _xp is not None:
+        return _xp
+    try:
+        import cupy as cp
+        cp.cuda.Device(0).compute_capability
+        _xp = (cp, True)
+        print("[radar_dsp] ✓ CuPy GPU 加速已启用")
+    except Exception:
+        _xp = (np, False)
+        print("[radar_dsp] CuPy 不可用, 使用 NumPy CPU 模式")
+    return _xp
+
+def simulate_adc(pc, vel, rcs, config: RadarConfig, batch_size=None):
     """
     点云到雷达 ADC 原始数据的正向仿真器
-    采用分批 (Batched) 矩阵运算，极大提高执行效率。
+    采用分批 (Batched) 矩阵运算, 支持 CuPy GPU 加速 (自动检测)。
     """
+    xp, is_gpu = _get_xp()
+    
+    # GPU 模式可用更大 batch; CPU 模式保守以控制内存
+    if batch_size is None:
+        batch_size = 200 if is_gpu else 50
+    
     P = pc.shape[0]
     # 在 TDM-MIMO 中，如果发射端不同时发射（时分复用），实际上是在不同的 Chirp 或时隙里发射
     # 为了简化且等效，这里我们直接生成一个大小为 NumChirps x (NumTx * NumRx) 的虚拟矩阵
     # 物理意义上相当于雷达硬件完成了 TDM 合并，直接提取出虚拟阵列
     N_virt = config.NumTx * config.NumRx
-    adc_cube = np.zeros((config.NumChirps, N_virt, config.NumSamples), dtype=np.complex128)
     
-    t_fast = np.arange(config.NumSamples) / config.Fs
-    t_slow = np.arange(config.NumChirps) * config.PRT
+    # complex64 精度足够且内存减半 (相比 complex128)
+    adc_cube = xp.zeros((config.NumChirps, N_virt, config.NumSamples), dtype=xp.complex64)
+    
+    t_fast = xp.asarray(np.arange(config.NumSamples, dtype=np.float32) / config.Fs)
+    t_slow = xp.asarray(np.arange(config.NumChirps, dtype=np.float32) * config.PRT)
     
     # 构建虚拟阵列天线的位置
     # 在进入 batch 循环前，预先构建 Tx 和 Rx 的扩展坐标矩阵
-    tx_arr = np.zeros((N_virt, 3))
-    rx_arr = np.zeros((N_virt, 3))
+    tx_arr_np = np.zeros((N_virt, 3), dtype=np.float32)
+    rx_arr_np = np.zeros((N_virt, 3), dtype=np.float32)
     v_idx = 0
     for t in range(config.NumTx):
         for r in range(config.NumRx):
-            tx_arr[v_idx] = config.TxPos[t]
-            rx_arr[v_idx] = config.RxPos[r]
+            tx_arr_np[v_idx] = config.TxPos[t]
+            rx_arr_np[v_idx] = config.RxPos[r]
             v_idx += 1
+    tx_arr = xp.asarray(tx_arr_np)
+    rx_arr = xp.asarray(rx_arr_np)
+    
+    fc_f32 = np.float32(config.fc)
+    K_f32 = np.float32(config.K)
+    c_f64 = config.c  # 光速保持 float64 避免距离精度损失
             
     # 进入 Batch 循环
     for i in range(0, P, batch_size):
         idx_end = min(i + batch_size, P)
-        pb_pc = pc[i:idx_end]    
-        pb_vel = vel[i:idx_end]  
-        pb_rcs = rcs[i:idx_end]  
+        pb_pc = xp.asarray(pc[i:idx_end].astype(np.float32))
+        pb_vel = xp.asarray(vel[i:idx_end].astype(np.float32))
+        pb_rcs = xp.asarray(rcs[i:idx_end].astype(np.float32))
         
         pos_n = pb_pc[:, None, :] + pb_vel[:, None, :] * t_slow[None, :, None]
         
-        # --- 优化点：利用广播一次性计算所有虚拟天线的距离 ---
+        # --- 利用广播一次性计算所有虚拟天线的距离 ---
         # pos_n 扩展为 (PB, Nc, 1, 3)，与 tx_arr (N_virt, 3) 广播计算
         pos_n_exp = pos_n[:, :, None, :]
-        R_tx = np.linalg.norm(pos_n_exp - tx_arr, axis=-1)
-        R_rx = np.linalg.norm(pos_n_exp - rx_arr, axis=-1)
+        diff_tx = pos_n_exp - tx_arr
+        diff_rx = pos_n_exp - rx_arr
+        R_tx = xp.sqrt(xp.sum(diff_tx * diff_tx, axis=-1))  # 比 linalg.norm 更快
+        R_rx = xp.sqrt(xp.sum(diff_rx * diff_rx, axis=-1))
                 
         # 计算双程飞行时间 Tau
-        tau = (R_tx + R_rx) / config.c # (PB, Nc, N_virt)
+        tau = (R_tx + R_rx) / c_f64  # (PB, Nc, N_virt)
         
         # IF 信号的完整相位模型: 2 * pi * [f_c * tau + K * tau * t_fast]
-        phase = 2 * np.pi * (config.fc * tau[:, :, :, None] + 
-                             config.K * tau[:, :, :, None] * t_fast[None, None, None, :])
+        tau_exp = tau[:, :, :, None]
+        phase = np.float32(2 * np.pi) * (fc_f32 * tau_exp + K_f32 * tau_exp * t_fast[None, None, None, :])
         
         # 幅值衰减模型：室内近距 (1-3m) 人体场景采用 1/R² 软化模型
         # 理论 1/R⁴ 在近距离动态范围过大，导致弱散射点被躯干掩盖
-        R_tx_clip = np.clip(R_tx, 0.1, None)
-        R_rx_clip = np.clip(R_rx, 0.1, None)
-        amp = np.sqrt(pb_rcs)[:, None, None] / (R_tx_clip * R_rx_clip)
+        R_tx_clip = xp.clip(R_tx, 0.1, None)
+        R_rx_clip = xp.clip(R_rx, 0.1, None)
+        amp = xp.sqrt(pb_rcs)[:, None, None] / (R_tx_clip * R_rx_clip)
         
-        # 生成复基带 IF 信号：
-        signal = amp[:, :, :, None] * np.exp(1j * phase)
+        # 生成复基带 IF 信号并叠加至 ADC 立方体
+        signal = amp[:, :, :, None] * xp.exp(1j * phase)
+        adc_cube += xp.sum(signal, axis=0)
         
-        # 将所有点的电磁波线性叠加至 ADC 立方体中
-        adc_cube += np.sum(signal, axis=0)
+        # 释放 batch 中间变量
+        del pos_n, pos_n_exp, diff_tx, diff_rx, R_tx, R_rx, tau, tau_exp, phase, amp, signal
         
     # 添加高斯白噪声模拟接收机真实热噪声与杂波
     # 我们基于纯理论回波的平均信号功率，设置一个动态的 SNR，比如 20dB
-    sig_power = np.mean(np.abs(adc_cube) ** 2)
+    sig_power = float(xp.mean(xp.abs(adc_cube) ** 2))
     target_snr_db = 20.0
     noise_power = sig_power / (10 ** (target_snr_db / 10.0))
     if noise_power == 0:
-        noise_power = 1e-12 # 防除0
-        
-    noise = (np.random.normal(scale=np.sqrt(noise_power/2), size=adc_cube.shape) + 
-             1j * np.random.normal(scale=np.sqrt(noise_power/2), size=adc_cube.shape))
+        noise_power = 1e-12  # 防除0
+    
+    noise_std = np.float32(np.sqrt(noise_power / 2))
+    noise = (xp.random.normal(0, noise_std, adc_cube.shape).astype(xp.float32) +
+             1j * xp.random.normal(0, noise_std, adc_cube.shape).astype(xp.float32))
     adc_cube += noise
     
     # 加入仪器不可避免的本振（VCO）相位噪声
-    phase_noise = np.random.normal(0, np.deg2rad(1.0), size=adc_cube.shape) # 1度
-    adc_cube *= np.exp(1j * phase_noise)
+    phase_noise = xp.random.normal(0, np.float32(np.deg2rad(1.0)), size=adc_cube.shape).astype(xp.float32)
+    adc_cube *= xp.exp(1j * phase_noise)
     
+    # GPU 模式: 将结果传回 CPU
+    if is_gpu:
+        adc_cube = adc_cube.get()
+        
     return adc_cube
 
 def process_radar_data(adc_cube, config: RadarConfig):
@@ -132,7 +175,7 @@ def process_radar_data(adc_cube, config: RadarConfig):
     num_vz = max_vz - min_vz + 1
     
     # 建立动态伸缩的虚拟面阵网格
-    grid = np.zeros((config.NumChirps, num_vz, num_vx, config.NumSamples // 2), dtype=np.complex128)
+    grid = np.zeros((config.NumChirps, num_vz, num_vx, config.NumSamples // 2), dtype=np.complex64)
     
     # 记录哪些网格位置有真实天线数据（用于 Capon 稀疏阵列处理）
     grid_mask = np.zeros((num_vz, num_vx), dtype=bool)
@@ -209,16 +252,15 @@ def capon_beamforming(data_vector, element_positions, scan_angles_deg, diag_load
         # 奇异矩阵 fallback: 返回 0°
         return 0.0, np.zeros(len(scan_angles_deg))
     
-    # 构建导向矢量矩阵并扫描 Capon 谱
-    scan_rad = np.deg2rad(scan_angles_deg)
-    spectrum = np.zeros(len(scan_angles_deg))
-    
-    for i, theta_r in enumerate(scan_rad):
-        # 导向矢量: a(θ) = exp(-j * 2π * d_pos * sin(θ))
-        # element_positions 已归一化为 d=λ/2 单位，空间频率 = sin(θ) / 2
-        a = np.exp(-1j * np.pi * element_positions * np.sin(theta_r)).reshape(N, 1)
-        denom = (a.conj().T @ R_inv @ a).real.item()
-        spectrum[i] = 1.0 / max(denom, 1e-20)
+    # 全向量化: 一次构建所有导向矢量矩阵并批量求 Capon 谱
+    # 导向矢量: a_n(θ) = exp(-jπ * pos_n * sin(θ))
+    # element_positions 已归一化为 d=λ/2 单位，空间频率 = sin(θ) / 2
+    scan_rad = np.deg2rad(scan_angles_deg)  # (M,)
+    A = np.exp(-1j * np.pi * element_positions[:, None] * np.sin(scan_rad[None, :]))  # (N, M)
+    R_inv_A = R_inv @ A  # (N, M)
+    # Capon 谱: P(θ) = 1 / Re(a^H R^{-1} a), 对角线元素 = 逐列点积
+    denom = np.real(np.sum(A.conj() * R_inv_A, axis=0))  # (M,)
+    spectrum = 1.0 / np.maximum(denom, 1e-20)
     
     # 峰值搜索 + 抛物线插值精化
     peak_idx = np.argmax(spectrum)

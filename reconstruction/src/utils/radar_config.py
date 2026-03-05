@@ -15,9 +15,9 @@ class RadarConfig:
     def __init__(self):
         self.c = const.c         # 光速 (m/s)
         self.fc = 61.5e9         # 载波频率 (Hz)
-        self.K_slope = 75e12    # 调频斜率 (Hz/s)
+        self.K_slope = 75e12     # 调频斜率 (Hz/s)
         self.B = 6e9             # 扫频带宽 (Hz)
-        self.Tc = 80e-6         # 单个 Chirp 扫频时间 (s)
+        self.Tc = 80e-6          # 单个 Chirp 扫频时间 (s)
         self.Fs = 10e6           # 采样率 (Hz) 
         
         self.NumSamples = 128    # 快时间采样点数
@@ -25,7 +25,7 @@ class RadarConfig:
         
         # 物理时长与常数
         self.K = self.K_slope    # 调频斜率
-        self.PRT = 100e-6         # 脉冲重复时间 (Chirp 周期)
+        self.PRT = 100e-6        # 脉冲重复时间 (Chirp 周期)
         
         # 虚拟天线阵列配置 (MIMO)
         # 根据用户要求的 4Tx 4Rx，采用 TDM-MIMO 模式产生 16 根虚拟接收天线

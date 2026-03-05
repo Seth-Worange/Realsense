@@ -73,8 +73,6 @@ class PointCloudSequencePlayer:
         逐帧读取，利用帧间光流法/质心差分法近似计算当前点云的速度 (velocity) 矩阵。
         
         :return: (pc_coords, velocities)
-                 velocities 即为雷达探测到的每个反射点的 [vx, vy, vz]
-                 如果是最后一段或空序列返回 None
         """
         if self.current_idx >= self.num_frames:
             return None, None
@@ -143,3 +141,24 @@ class PointCloudSequencePlayer:
             
         rcs = np.ones(pc.shape[0]) * constant_rcs
         return pc, vel, rcs
+
+    def iter_all_as_radar_targets(self, constant_rcs=0.1):
+        """
+        生成器：逐帧遍历整个序列，yield (frame_idx, pc, vel, rcs)。
+        
+        利用内部状态机顺序读取，每帧自动通过 KDTree 最近邻匹配估算速度。
+        比逐帧调用 get_all_as_radar_targets() 高效，因为避免了重复加载前一帧。
+        """
+        self.reset()
+        
+        for frame_idx in range(self.num_frames):
+            pc, vel = self.next_frame_with_velocity()
+            
+            if pc is None or len(pc) == 0:
+                continue
+            
+            rcs = np.ones(pc.shape[0]) * constant_rcs
+            yield frame_idx, pc, vel, rcs
+        
+        # 遍历结束后重置状态机，避免污染后续调用
+        self.reset()
