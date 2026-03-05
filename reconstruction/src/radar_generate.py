@@ -25,7 +25,7 @@ from utils.radar_dsp import simulate_adc, process_radar_data, extract_point_clou
 
 def transform_to_radar_frame(pc, vel, radar_pitch_deg=0):
     """
-    RealSense 坐标系 → Radar 坐标系变换
+    RealSense  → Radar Coordinate
     RealSense: X right, Y down, Z forward
     Radar:     X right (azimuth), Y forward (depth), Z up (elevation)
     """
@@ -39,8 +39,9 @@ def transform_to_radar_frame(pc, vel, radar_pitch_deg=0):
     vel_radar[:, 1] = vel[:, 2]
     vel_radar[:, 2] = -vel[:, 1]
 
-    # 俯仰角旋转补偿
+    # Pitch angle compensation
     theta = np.deg2rad(radar_pitch_deg)
+    # Rotation matrix
     R_x = np.array([
         [1, 0, 0],
         [0, np.cos(theta), -np.sin(theta)],
@@ -54,7 +55,7 @@ def transform_to_radar_frame(pc, vel, radar_pitch_deg=0):
 
 def process_single_frame(pc, vel, rcs, config):
     """
-    单帧完整仿真管线: 坐标变换 → ADC 仿真 → DSP → 点云提取
+    Single frame processing
     
     Returns: (pc_radar_frame, rdm, radar_pc, range_axis, doppler_axis)
     """
@@ -69,12 +70,14 @@ def process_single_frame(pc, vel, rcs, config):
 
 
 def render_rd_map(rdm, range_axis, doppler_axis, frame_idx=None):
-    """渲染 Range-Doppler 谱图到 PIL Image"""
+    """
+    Save Range-Doppler Map to PIL Image
+    """
     fig, ax = plt.subplots(figsize=(6, 5))
     rdm_db = 10 * np.log10(rdm + 1e-10)
     im = ax.imshow(rdm_db, aspect='auto',
                    extent=[range_axis[0], range_axis[-1], doppler_axis[0], doppler_axis[-1]],
-                   cmap='jet', origin='lower')
+                   cmap='jet', origin='lower', vmin=5, vmax=50)
     title = 'Range-Doppler Map'
     if frame_idx is not None:
         title += f' (Frame {frame_idx})'
@@ -89,12 +92,25 @@ def render_rd_map(rdm, range_axis, doppler_axis, frame_idx=None):
     return img
 
 
-def render_rs_pointcloud(pc_radar, frame_idx=None):
-    """渲染 RealSense 点云 3D 视图到 PIL Image"""
+def render_rs_pointcloud(pc_radar, vel_radar, frame_idx=None):
+    """
+    Save RealSense Point Cloud to PIL Image
+    """
     fig = plt.figure(figsize=(6, 5))
     ax = fig.add_subplot(111, projection='3d')
     ax.scatter(pc_radar[:, 0], pc_radar[:, 1], pc_radar[:, 2],
-               c='steelblue', s=2, alpha=0.3)
+               c='steelblue', s=2, alpha=0.1)
+
+    # Draw velocity arrows (downsample to avoid excessive density)
+    stride = 30
+    p_s = pc_radar[::stride]
+    v_s = vel_radar[::stride]
+    if len(p_s) > 0:
+        ax.quiver(p_s[:, 0], p_s[:, 1], p_s[:, 2],
+                  v_s[:, 0], v_s[:, 1], v_s[:, 2],
+                  length=0.3, normalize=False, color='red', alpha=0.6,
+                  arrow_length_ratio=0.3, linewidth=0.5)
+
     title = 'RealSense Point Cloud (Radar Frame)'
     if frame_idx is not None:
         title += f' (Frame {frame_idx})'
@@ -114,18 +130,20 @@ def render_rs_pointcloud(pc_radar, frame_idx=None):
 
 
 def render_radar_pointcloud(pc_radar, radar_pc, frame_idx=None):
-    """渲染雷达仿真点云 3D 视图到 PIL Image (底座: Ground Truth)"""
+    """
+    Save Radar Point Cloud to PIL Image (Base: Ground Truth)
+    """
     fig = plt.figure(figsize=(6, 5))
     ax = fig.add_subplot(111, projection='3d')
 
-    # Ground Truth 底座
+    # Ground Truth
     ax.scatter(pc_radar[:, 0], pc_radar[:, 1], pc_radar[:, 2],
-               c='gray', s=2, alpha=0.2, label='Ground Truth')
+               c='gray', s=2, alpha=0.2, label='Ground Truth', vmin=-3, vmax=3)
 
-    # 雷达仿真点云
+    # Radar Point Cloud
     if len(radar_pc) > 0:
         scatter = ax.scatter(radar_pc[:, 0], radar_pc[:, 1], radar_pc[:, 2],
-                             c=radar_pc[:, 3], cmap='coolwarm', s=30,
+                             c=radar_pc[:, 3], cmap='coolwarm', s=20,
                              edgecolors='black', alpha=0.9)
         fig.colorbar(scatter, label='Velocity (m/s)', ax=ax, shrink=0.5, pad=0.1)
 
@@ -193,7 +211,7 @@ def run_single_frame(player, config, target_frame, output_dir):
     rdm_db = 10 * np.log10(rdm + 1e-10)
     plt.imshow(rdm_db, aspect='auto',
                extent=[range_axis[0], range_axis[-1], doppler_axis[0], doppler_axis[-1]],
-               cmap='jet', origin='lower')
+               cmap='jet', origin='lower', vmin=5, vmax=50)
     plt.title('Range-Doppler Map (RDM)')
     plt.xlabel('Range (m)')
     plt.ylabel('Velocity (m/s)')
@@ -242,7 +260,7 @@ def run_continuous(player, config, output_dir):
 
         # 渲染三张图
         rd_images.append(render_rd_map(rdm, range_axis, doppler_axis, frame_idx))
-        rs_images.append(render_rs_pointcloud(pc_radar, frame_idx))
+        rs_images.append(render_rs_pointcloud(pc_radar, vel_radar, frame_idx))
         radar_images.append(render_radar_pointcloud(pc_radar, radar_pc, frame_idx))
 
         elapsed = time.time() - frame_t0
@@ -254,7 +272,7 @@ def run_continuous(player, config, output_dir):
     print(f"\n全部 {len(rd_images)} 帧处理完成, 总耗时 {total_time:.1f}s")
 
     # 保存 GIF
-    print("正在生成 GIF 动画...")
+    print("正在生成 GIF ...")
     fps = player.fps
     save_gif(rd_images, os.path.join(output_dir, 'rd_spectrum.gif'), fps)
     save_gif(rs_images, os.path.join(output_dir, 'rs_pointcloud.gif'), fps)
