@@ -14,54 +14,61 @@ from scipy.ndimage import percentile_filter
 from .radar_config import RadarConfig
 
 # ------------------------------------------------------------------
-# GPU / CPU 自适应后端
-# 首次调用 simulate_adc 时懒初始化, 避免 import 阶段阻塞
+# Auto choose GPU / CPU 
+# First call simulate_adc to initialize
 # ------------------------------------------------------------------
-_xp = None  # 延迟绑定: cupy 或 numpy
+_xp = None 
+CUDA_DEVICE_ID = 0  # Default to GPU 0
 
 def _get_xp():
-    """懒初始化计算后端, 返回 (xp, is_gpu)"""
+    """
+    Auto choose GPU / CPU
+    """
     global _xp
     if _xp is not None:
         return _xp
     try:
         import cupy as cp
-        cp.cuda.Device(0).compute_capability
+        # 指定使用的显卡编号并检查可用性
+        cp.cuda.Device(CUDA_DEVICE_ID).use()
+        cp.cuda.Device(CUDA_DEVICE_ID).compute_capability
         _xp = (cp, True)
-        print("[radar_dsp] ✓ CuPy GPU 加速已启用")
+        print(f"[radar_dsp] ✓ CuPy GPU 加速已启用 (Device {CUDA_DEVICE_ID})")
     except Exception:
         _xp = (np, False)
-        print("[radar_dsp] CuPy 不可用, 使用 NumPy CPU 模式")
+        print("[radar_dsp] CuPy 不可用或显卡序号错误, 使用 NumPy CPU 模式")
     return _xp
 
 def simulate_adc(pc, vel, rcs, config: RadarConfig, batch_size=None):
     """
-    点云到雷达 ADC 原始数据的正向仿真器
-    采用分批 (Batched) 矩阵运算, 支持 CuPy GPU 加速 (自动检测)。
+    RS Point Cloud -> Radar ADC Raw Data
+    采用分批 (Batched) 矩阵运算, 支持 CuPy GPU 加速。
     """
     xp, is_gpu = _get_xp()
     
-    # GPU 模式可用更大 batch; CPU 模式保守以控制内存
+    # BatchSize varies between gpu and cpu
     if batch_size is None:
-        batch_size = 200 if is_gpu else 50
+        batch_size = 256 if is_gpu else 50
     
     P = pc.shape[0]
-    # 在 TDM-MIMO 中，如果发射端不同时发射（时分复用），实际上是在不同的 Chirp 或时隙里发射
-    # 为了简化且等效，这里我们直接生成一个大小为 NumChirps x (NumTx * NumRx) 的虚拟矩阵
-    # 物理意义上相当于雷达硬件完成了 TDM 合并，直接提取出虚拟阵列
+
+    # Virtual Array
     N_virt = config.NumTx * config.NumRx
     
-    # complex64 精度足够且内存减半 (相比 complex128)
+    # 构建3D Radar Cube
+    # complex64 精度
     adc_cube = xp.zeros((config.NumChirps, N_virt, config.NumSamples), dtype=xp.complex64)
     
+    # 快慢时间维度
     t_fast = xp.asarray(np.arange(config.NumSamples, dtype=np.float32) / config.Fs)
     t_slow = xp.asarray(np.arange(config.NumChirps, dtype=np.float32) * config.PRT)
     
-    # 构建虚拟阵列天线的位置
-    # 在进入 batch 循环前，预先构建 Tx 和 Rx 的扩展坐标矩阵
+    # 构建虚拟阵列天线的位置（坐标矩阵）
     tx_arr_np = np.zeros((N_virt, 3), dtype=np.float32)
     rx_arr_np = np.zeros((N_virt, 3), dtype=np.float32)
     v_idx = 0
+
+    # 记录虚拟天线中每个通道对应的收发天线
     for t in range(config.NumTx):
         for r in range(config.NumRx):
             tx_arr_np[v_idx] = config.TxPos[t]
@@ -81,50 +88,67 @@ def simulate_adc(pc, vel, rcs, config: RadarConfig, batch_size=None):
         pb_vel = xp.asarray(vel[i:idx_end].astype(np.float32))
         pb_rcs = xp.asarray(rcs[i:idx_end].astype(np.float32))
         
+        # Constant Velocity Model
+        # pos_n = pb_pc + pb_vel * t_slow
+        # (BatchSize, NumChirps, 3)
         pos_n = pb_pc[:, None, :] + pb_vel[:, None, :] * t_slow[None, :, None]
         
         # --- 利用广播一次性计算所有虚拟天线的距离 ---
-        # pos_n 扩展为 (PB, Nc, 1, 3)，与 tx_arr (N_virt, 3) 广播计算
+        # pos_n：[Nums, Chirps, Pos] --> (BatchSize, NumChirps, 3)
+        # tx_arr/rx_arr：[NumVirt, Pos] --> (NumVirt, 3)
         pos_n_exp = pos_n[:, :, None, :]
+
+        # 散射点到收发天线距离（广播从-1元素开始比对）
         diff_tx = pos_n_exp - tx_arr
         diff_rx = pos_n_exp - rx_arr
-        R_tx = xp.sqrt(xp.sum(diff_tx * diff_tx, axis=-1))  # 比 linalg.norm 更快
+
+        # R_tx/R_rx: (BatchSize, NumChirps, NumVirt)
+        R_tx = xp.sqrt(xp.sum(diff_tx * diff_tx, axis=-1)) 
         R_rx = xp.sqrt(xp.sum(diff_rx * diff_rx, axis=-1))
                 
         # 计算双程飞行时间 Tau
-        tau = (R_tx + R_rx) / c_f64  # (PB, Nc, N_virt)
+        # tau: (BatchSize, NumChirps, NumVirt)
+        tau = (R_tx + R_rx) / c_f64  
         
-        # IF 信号的完整相位模型: 2 * pi * [f_c * tau + K * tau * t_fast]
+        # IF 信号相位模型: 2 * pi * [f_c * tau + K * tau * t_fast]
         tau_exp = tau[:, :, :, None]
+        # phase: (BatchSize, NumChirps, NumVirt, NumSamples)
         phase = np.float32(2 * np.pi) * (fc_f32 * tau_exp + K_f32 * tau_exp * t_fast[None, None, None, :])
         
         # 幅值衰减模型：室内近距 (1-3m) 人体场景采用 1/R² 软化模型
         # 理论 1/R⁴ 在近距离动态范围过大，导致弱散射点被躯干掩盖
         R_tx_clip = xp.clip(R_tx, 0.1, None)
         R_rx_clip = xp.clip(R_rx, 0.1, None)
+        # 目前简单认为人体各个散射点RCS相同
         amp = xp.sqrt(pb_rcs)[:, None, None] / (R_tx_clip * R_rx_clip)
         
         # 生成复基带 IF 信号并叠加至 ADC 立方体
+        # signal: (BatchSize, NumChirps, NumVirt, NumSamples)
         signal = amp[:, :, :, None] * xp.exp(1j * phase)
+
+        # 人体目标信号合成
         adc_cube += xp.sum(signal, axis=0)
         
         # 释放 batch 中间变量
         del pos_n, pos_n_exp, diff_tx, diff_rx, R_tx, R_rx, tau, tau_exp, phase, amp, signal
         
     # 添加高斯白噪声模拟接收机真实热噪声与杂波
-    # 我们基于纯理论回波的平均信号功率，设置一个动态的 SNR，比如 20dB
+    # 基于纯理论回波的平均信号功率，设置一个动态的 SNR = 20dB
     sig_power = float(xp.mean(xp.abs(adc_cube) ** 2))
     target_snr_db = 20.0
+
+    # 噪声功率
     noise_power = sig_power / (10 ** (target_snr_db / 10.0))
     if noise_power == 0:
-        noise_power = 1e-12  # 防除0
-    
+        noise_power = 1e-12  # 防除0 
+    # 噪声方差
     noise_std = np.float32(np.sqrt(noise_power / 2))
+    # 复噪声信号
     noise = (xp.random.normal(0, noise_std, adc_cube.shape).astype(xp.float32) +
              1j * xp.random.normal(0, noise_std, adc_cube.shape).astype(xp.float32))
     adc_cube += noise
     
-    # 加入仪器不可避免的本振（VCO）相位噪声
+    # 加入仪器本振（VCO）相位噪声
     phase_noise = xp.random.normal(0, np.float32(np.deg2rad(1.0)), size=adc_cube.shape).astype(xp.float32)
     adc_cube *= xp.exp(1j * phase_noise)
     
@@ -132,34 +156,40 @@ def simulate_adc(pc, vel, rcs, config: RadarConfig, batch_size=None):
     if is_gpu:
         adc_cube = adc_cube.get()
         
+    # (NumChirps, NumVirt, NumSamples)
     return adc_cube
 
 def process_radar_data(adc_cube, config: RadarConfig):
     """
-    雷达数字信号处理 (DSP) 链路：Range FFT -> Doppler FFT -> 构建虚拟阵列网格
-    角度估计由 Capon 波束形成在 extract_point_cloud 中完成
+    DSP链路：Range FFT -> Doppler FFT -> 构建虚拟阵列网格
+    角度估计：Capon 波束形成
     """
-    # 1. 距离域 FFT (快时间)
+    # 距离维 FFT 
+    n_fft_range = config.NumSamples * 2
     win_range = np.hanning(config.NumSamples)
     adc_cube_w = adc_cube * win_range[None, None, :]
-    range_fft = np.fft.fft(adc_cube_w, axis=2)
-    range_fft = range_fft[:, :, :config.NumSamples // 2] # 截取有效频段
+    range_fft = np.fft.fft(adc_cube_w, n=n_fft_range, axis=2)
+    range_fft = range_fft[:, :, :n_fft_range // 2] # 截取正频率段 (对应 0 -> R_max)
     
-    # 计算距离物理坐标轴
-    fast_freqs = np.fft.fftfreq(config.NumSamples, d=1/config.Fs)[:config.NumSamples // 2]
+    # 距离物理坐标轴
+    fast_freqs = np.fft.fftfreq(n_fft_range, d=1/config.Fs)[:n_fft_range // 2]
     range_axis = fast_freqs * config.c / (2 * config.K)
     
-    # 2. 多普勒域 FFT (慢时间)
+    # 多普勒维 FFT
     win_doppler = np.hanning(config.NumChirps)
     range_fft_w = range_fft * win_doppler[:, None, None]
     doppler_fft = np.fft.fftshift(np.fft.fft(range_fft_w, axis=0), axes=0)
     
-    # 计算速度物理坐标轴
+    # 多普勒物理坐标轴
     slow_freqs = np.fft.fftshift(np.fft.fftfreq(config.NumChirps, d=config.PRT))
     doppler_axis = slow_freqs * config.wavelength / 2
+
+    # 聚合获得 距离-多普勒 雷达图 (Range-Doppler Map)
+    rdm = np.mean(np.abs(doppler_fft), axis=1)
     
-    # 3. 构建虚拟天线面阵网格 (用于后续 Capon 波束形成)
+    # 构建虚拟天线面阵网格
     d = config.wavelength / 2
+    n_bins_range = n_fft_range // 2
     
     # 动态获取网格坐标范围以兼容带有整体偏移量的高程配置
     vx_list = []
@@ -175,9 +205,9 @@ def process_radar_data(adc_cube, config: RadarConfig):
     num_vz = max_vz - min_vz + 1
     
     # 建立动态伸缩的虚拟面阵网格
-    grid = np.zeros((config.NumChirps, num_vz, num_vx, config.NumSamples // 2), dtype=np.complex64)
+    grid = np.zeros((config.NumChirps, num_vz, num_vx, n_bins_range), dtype=np.complex64)
     
-    # 记录哪些网格位置有真实天线数据（用于 Capon 稀疏阵列处理）
+    # 记录哪些网格位置有真实天线数据
     grid_mask = np.zeros((num_vz, num_vx), dtype=bool)
     
     idx = 0
@@ -196,10 +226,7 @@ def process_radar_data(adc_cube, config: RadarConfig):
     # 俯仰: 取纵向阵元最多的列, 提取该列中有数据的行索引
     col_counts = np.sum(grid_mask, axis=0)
     best_vx_col = np.argmax(col_counts)
-    el_element_indices = np.where(grid_mask[:, best_vx_col])[0]
-    
-    # 聚合获得 距离-多普勒 雷达图 (Range-Doppler Map)
-    rdm = np.mean(np.abs(doppler_fft), axis=1)
+    el_element_indices = np.where(grid_mask[:, best_vx_col])[0]    
     
     # 构建返回的阵列元数据
     array_info = {
@@ -400,7 +427,7 @@ def extract_point_cloud(array_info, range_axis, doppler_axis, rdm):
     el_positions = el_indices.astype(float)
     
     # 信号质量阈值：Capon 谱峰值/均值 > 此值才接受该角度
-    PEAK_SNR_THRESHOLD = 3.0
+    PEAK_SNR_THRESHOLD = 3.5
     
     # --- OS-CFAR 检测 ---
     cfar_mask = ca_cfar_2d(rdm)
@@ -413,7 +440,7 @@ def extract_point_cloud(array_info, range_axis, doppler_axis, rdm):
     # --- 邻域扩展（仅围绕 CFAR 检出点） ---
     N_dop, N_rng = rdm.shape
     NEIGHBOR_RADIUS = 2
-    NEIGHBOR_RATIO = 0.5
+    NEIGHBOR_RATIO = 0.55
     
     neighbor_bins = set()
     for d_idx, r_idx in cfar_bins:

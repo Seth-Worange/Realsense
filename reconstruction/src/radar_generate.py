@@ -85,7 +85,7 @@ def render_rd_map(rdm, range_axis, doppler_axis, frame_idx=None):
     ax.set_xlabel('Range (m)')
     ax.set_ylabel('Velocity (m/s)')
     fig.colorbar(im, label='Power (dB)')
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.2, right=0.95, top=0.9, bottom=0.1)
 
     img = _fig_to_pil(fig)
     plt.close(fig)
@@ -102,7 +102,7 @@ def render_rs_pointcloud(pc_radar, vel_radar, frame_idx=None):
                c='steelblue', s=2, alpha=0.1)
 
     # Draw velocity arrows (downsample to avoid excessive density)
-    stride = 30
+    stride = 50
     p_s = pc_radar[::stride]
     v_s = vel_radar[::stride]
     if len(p_s) > 0:
@@ -122,7 +122,7 @@ def render_rs_pointcloud(pc_radar, vel_radar, frame_idx=None):
     ax.set_ylim(0, 8)
     ax.set_zlim(-1, 2)
     ax.view_init(elev=20, azim=-60)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.1)
 
     img = _fig_to_pil(fig)
     plt.close(fig)
@@ -138,13 +138,13 @@ def render_radar_pointcloud(pc_radar, radar_pc, frame_idx=None):
 
     # Ground Truth
     ax.scatter(pc_radar[:, 0], pc_radar[:, 1], pc_radar[:, 2],
-               c='gray', s=2, alpha=0.2, label='Ground Truth', vmin=-3, vmax=3)
+               c='gray', s=2, alpha=0.2, label='Ground Truth')
 
     # Radar Point Cloud
     if len(radar_pc) > 0:
         scatter = ax.scatter(radar_pc[:, 0], radar_pc[:, 1], radar_pc[:, 2],
                              c=radar_pc[:, 3], cmap='coolwarm', s=20,
-                             edgecolors='black', alpha=0.9)
+                             edgecolors='black', alpha=0.9, vmin=-3, vmax=3)
         fig.colorbar(scatter, label='Velocity (m/s)', ax=ax, shrink=0.5, pad=0.1)
 
     title = 'Simulated Radar Point Cloud'
@@ -159,7 +159,7 @@ def render_radar_pointcloud(pc_radar, radar_pc, frame_idx=None):
     ax.set_ylim(0, 8)
     ax.set_zlim(-1, 2)
     ax.view_init(elev=20, azim=-60)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.1)
 
     img = _fig_to_pil(fig)
     plt.close(fig)
@@ -168,14 +168,14 @@ def render_radar_pointcloud(pc_radar, radar_pc, frame_idx=None):
 
 def _fig_to_pil(fig):
     """
-    save matplotlib figure to PIL Image
+    save matplotlib figure to PIL Image (Optimized: direct buffer access)
     """
-    # use buffer to accelerate
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=120)
-    buf.seek(0)
-    img = Image.open(buf).convert('RGB')
-    return img
+    fig.canvas.draw()
+    # 提取渲染后的 RGBA 像素缓冲区
+    rgba_buffer = fig.canvas.buffer_rgba()
+    # 直接构建 PIL 对象，避免 savefig 的 PNG 压缩/解压开销
+    img = Image.frombuffer('RGBA', fig.canvas.get_width_height(), rgba_buffer, 'raw', 'RGBA', 0, 1)
+    return img.convert('RGB')
 
 
 def save_gif(images, output_path, fps):
@@ -230,7 +230,7 @@ def run_single_frame(player, config, target_frame, output_dir):
     if len(radar_pc) > 0:
         scatter = ax.scatter(radar_pc[:, 0], radar_pc[:, 1], radar_pc[:, 2],
                              c=radar_pc[:, 3], cmap='coolwarm', s=30,
-                             edgecolors='black', alpha=0.9)
+                             edgecolors='black', alpha=0.9, vmin=-3, vmax=3)
         plt.colorbar(scatter, label='Velocity (m/s)', ax=ax, shrink=0.5, pad=0.1)
     ax.set_title('3D Radar Point Cloud')
     ax.set_xlabel('Azimuth/X (m)')
@@ -267,15 +267,18 @@ def run_continuous(player, config, output_dir):
 
         pc_radar, vel_radar, rdm, radar_pc, range_axis, doppler_axis = process_single_frame(pc, vel, rcs, config)
 
+        draw_t0 = time.time()
         # RD-Map, RS-Pointcloud, Radar-Pointcloud
         rd_images.append(render_rd_map(rdm, range_axis, doppler_axis, frame_idx))
         rs_images.append(render_rs_pointcloud(pc_radar, vel_radar, frame_idx))
         radar_images.append(render_radar_pointcloud(pc_radar, radar_pc, frame_idx))
 
+        draw_elapsed = time.time() - draw_t0
         elapsed = time.time() - frame_t0
         print(f"  帧 {frame_idx:4d}/{total_frames} | "
               f"雷达点: {len(radar_pc):4d} | "
-              f"耗时: {elapsed:.2f}s")
+              f"绘图耗时: {draw_elapsed:.2f}s |"
+              f"总耗时: {elapsed:.2f}s")
 
     total_time = time.time() - t0
     print(f"\n全部 {len(rd_images)} 帧处理完成, 总耗时 {total_time:.1f}s")

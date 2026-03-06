@@ -114,22 +114,20 @@ class PointCloudSequencePlayer:
         saved_prev = self.prev_pc_coords
         
         if frame_idx == 0:
-            # 第0帧速度用第1帧的速度代替
+            pc, _ = self.load_frame(0)
+            vel = np.zeros_like(pc)
+            # 第0帧没有前置帧，cKDTree关联匹配
             if self.num_frames > 1:
-                self.current_idx = 0
-                self.prev_pc_coords = self.load_frame(0)[0]
-                _, next_vel = self.next_frame_with_velocity()
-                
-                # 重新读一回第 0 帧的空间数据
-                pc, _ = self.load_frame(0)
-                vel = next_vel[:len(pc)] if next_vel is not None else np.zeros_like(pc)
-            else:
-                pc, _ = self.load_frame(0)
-                vel = np.zeros_like(pc)
+                pc1, _ = self.load_frame(1)
+                if len(pc1) > 0 and len(pc) > 0:
+                    tree = cKDTree(pc)
+                    distances, indices = tree.query(pc1, k=1)
+                    valid_mask = distances < 0.5
+                    vel[indices[valid_mask]] = (pc1[valid_mask] - pc[indices[valid_mask]]) / self.dt
         else:
             # 计算 frame_idx-1 -> frame_idx 的速度
-            self.current_idx = frame_idx                          # 直接指向目标帧
-            self.prev_pc_coords = self.load_frame(frame_idx - 1)[0]  # 前一帧始终存在(frame_idx >= 1)
+            self.current_idx = frame_idx
+            self.prev_pc_coords = self.load_frame(frame_idx - 1)[0]
             pc, vel = self.next_frame_with_velocity()
         
         # 恢复状态机
@@ -144,13 +142,13 @@ class PointCloudSequencePlayer:
 
     def iter_all_as_radar_targets(self, constant_rcs=0.1):
         """
-        生成器：逐帧遍历整个序列，yield (frame_idx, pc, vel, rcs)。
+        逐帧遍历整个序列
+        Output: (frame_idx, pc, vel, rcs)。
         
-        利用内部状态机顺序读取，每帧自动通过 KDTree 最近邻匹配估算速度。
-        比逐帧调用 get_all_as_radar_targets() 高效，因为避免了重复加载前一帧。
+        利用内部状态机顺序读取，每帧通过 KDTree 最近邻匹配估算速度。
         """
         self.reset()
-        
+        # 读取第0帧时速度直接置零，影响不大
         for frame_idx in range(self.num_frames):
             pc, vel = self.next_frame_with_velocity()
             
@@ -160,5 +158,5 @@ class PointCloudSequencePlayer:
             rcs = np.ones(pc.shape[0]) * constant_rcs
             yield frame_idx, pc, vel, rcs
         
-        # 遍历结束后重置状态机，避免污染后续调用
+        # 重置状态机
         self.reset()

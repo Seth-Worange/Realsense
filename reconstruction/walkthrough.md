@@ -1,4 +1,4 @@
-# 毫米波雷达人体点云仿真算法流程详解
+# Realsense Pointcloud to mmWave Radar Simulation
 
 ## 项目总览
 
@@ -54,6 +54,7 @@ graph TB
 ## 阶段 1：数据采集
 
 ### 涉及文件
+
 - [realsense.py](file:///c:/OrangeFiles/科研/Realsense/reconstruction/src/utils/realsense.py) — RealSense 处理器核心
 - [pcdRebuild.py](file:///c:/OrangeFiles/科研/Realsense/reconstruction/src/pcdRebuild.py) — 实时 3D 可视化 UI
 - [collect_human_pcd.py](file:///c:/OrangeFiles/科研/Realsense/reconstruction/src/collect_human_pcd.py) — 点云序列采集 UI
@@ -72,6 +73,7 @@ graph TB
 ## 阶段 2：数据预处理
 
 ### 涉及文件
+
 - [seq_loader.py](file:///c:/OrangeFiles/科研/Realsense/reconstruction/src/utils/seq_loader.py) — 点云序列加载与速度估计
 - [radar_generate.py](file:///c:/OrangeFiles/科研/Realsense/reconstruction/src/radar_generate.py) — 主管线 (坐标变换部分)
 
@@ -100,13 +102,14 @@ velocity = (当前帧点位置 - 上一帧最近邻点位置) / dt
 
 RealSense 和雷达使用不同的坐标约定：
 
-| 方向 | RealSense 坐标系 | 雷达坐标系 |
-|------|-----------------|-----------|
-| 水平 | X → 右 | X → 右 (方位) |
-| 纵深 | Z → 前 | Y → 前 (深度) |
-| 垂直 | Y → **下** | Z → **上** (俯仰) |
+| 方向 | RealSense 坐标系 | 雷达坐标系       |
+| ---- | ---------------- | ---------------- |
+| 水平 | X → 右           | X → 右 (方位)    |
+| 纵深 | Z → 前           | Y → 前 (深度)    |
+| 垂直 | Y →**下**        | Z →**上** (俯仰) |
 
 变换公式：
+
 ```python
 radar_X = rs_X        # 水平不变
 radar_Y = rs_Z        # 深度轴映射
@@ -124,24 +127,25 @@ radar_Z = -rs_Y       # 垂直轴翻转
 ## 阶段 3：雷达正向仿真（ADC 生成）
 
 ### 涉及文件
+
 - [radar_config.py](file:///c:/OrangeFiles/科研/Realsense/reconstruction/src/utils/radar_config.py) — 雷达参数配置
 - [radar_dsp.py → simulate_adc()](file:///c:/OrangeFiles/科研/Realsense/reconstruction/src/utils/radar_dsp.py#L16-L92) — ADC 仿真核心
 
 ### 3.1 雷达系统参数
 
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| 载波频率 f_c | 61.5 GHz | V-Band 毫米波 |
-| 扫频带宽 B | 6 GHz | 距离分辨率 ≈ 2.5 cm |
-| 调频斜率 K | 75 THz/s | |
-| Chirp 周期 T_c | 80 μs | |
-| PRT | 100 μs | 脉冲重复时间 |
-| 采样率 F_s | 10 MHz | |
-| 快时间采样点 | 128 | |
-| 慢时间 Chirp 数 | 128 | |
-| Tx 天线 | 4 个 | 不规则面阵排布 |
-| Rx 天线 | 4 个 | 均匀线阵 (X方向, d间隔) |
-| MIMO 模式 | TDM | 产生 16 根虚拟天线 |
+| 参数            | 值       | 说明                    |
+| --------------- | -------- | ----------------------- |
+| 载波频率 f_c    | 61.5 GHz | V-Band 毫米波           |
+| 扫频带宽 B      | 6 GHz    | 距离分辨率 ≈ 2.5 cm     |
+| 调频斜率 K      | 75 THz/s |                         |
+| Chirp 周期 T_c  | 80 μs    |                         |
+| PRT             | 100 μs   | 脉冲重复时间            |
+| 采样率 F_s      | 10 MHz   |                         |
+| 快时间采样点    | 128      |                         |
+| 慢时间 Chirp 数 | 128      |                         |
+| Tx 天线         | 4 个     | 不规则面阵排布          |
+| Rx 天线         | 4 个     | 均匀线阵 (X方向, d间隔) |
+| MIMO 模式       | TDM      | 产生 16 根虚拟天线      |
 
 ### 3.2 天线阵列配置
 
@@ -166,24 +170,42 @@ radar_Z = -rs_Y       # 垂直轴翻转
 **① 动态位置计算**
 
 散射点随时间运动：
-$$\text{pos}(t) = \text{pos}_0 + \text{vel} \times t_{\text{slow}}$$
+
+$$
+\text{pos}(t) = \text{pos}_0 + \text{vel} \times t_{\text{slow}}
+$$
 
 **② 双程距离计算**
 
 对每个虚拟天线（Tx-Rx 组合），计算发射和接收路径：
-$$R_{tx} = \|\text{pos}(t) - \text{Tx}_i\|, \quad R_{rx} = \|\text{pos}(t) - \text{Rx}_j\|$$
+
+$$
+R_{tx} = \|\text{pos}(t) - \text{Tx}_i\|, \quad R_{rx} = \|\text{pos}(t) - \text{Rx}_j\|
+$$
 
 **③ 飞行时间**
-$$\tau = (R_{tx} + R_{rx}) / c$$
+
+$$
+\tau = (R_{tx} + R_{rx}) / c
+$$
 
 **④ IF 信号相位**：FMCW 差频信号的相位模型
-$$\phi = 2\pi (f_c \cdot \tau + K \cdot \tau \cdot t_{\text{fast}})$$
+
+$$
+\phi = 2\pi (f_c \cdot \tau + K \cdot \tau \cdot t_{\text{fast}})
+$$
 
 **⑤ 幅值衰减**：采用 **1/R² 软化模型**（而非理论 1/R⁴），因为近距离 (1-3m) 人体场景中 R⁴ 动态范围过大会导致弱散射点被掩盖
-$$A = \sqrt{\text{RCS}} / (R_{tx} \cdot R_{rx})$$
+
+$$
+A = \sqrt{\text{RCS}} / (R_{tx} \cdot R_{rx})
+$$
 
 **⑥ 信号叠加**：所有散射点的 IF 信号线性叠加到 ADC 立方体中
-$$\text{adc\_cube} = \sum_{p} A_p \cdot e^{j\phi_p}$$
+
+$$
+\text{adc\_cube} = \sum_{p} A_p \cdot e^{j\phi_p}
+$$
 
 ### 3.4 噪声模型
 
@@ -197,6 +219,7 @@ $$\text{adc\_cube} = \sum_{p} A_p \cdot e^{j\phi_p}$$
 ## 阶段 4：DSP 信号处理链路
 
 ### 涉及文件
+
 - [radar_dsp.py → process_radar_data()](file:///c:/OrangeFiles/科研/Realsense/reconstruction/src/utils/radar_dsp.py#L94-L172) — DSP 链路
 
 ### 4.1 距离域 FFT (Range FFT)
@@ -246,6 +269,7 @@ rdm = mean(|doppler_fft|, axis=天线维) # 跨天线平均功率
 ## 阶段 5：目标检测与角度估计
 
 ### 涉及文件
+
 - [radar_dsp.py → extract_point_cloud()](file:///c:/OrangeFiles/科研/Realsense/reconstruction/src/utils/radar_dsp.py#L342-L452) — 点云提取
 - [radar_dsp.py → ca_cfar_2d()](file:///c:/OrangeFiles/科研/Realsense/reconstruction/src/utils/radar_dsp.py#L243-L272) — OS-CFAR
 - [radar_dsp.py → capon_beamforming()](file:///c:/OrangeFiles/科研/Realsense/reconstruction/src/utils/radar_dsp.py#L175-L241) — Capon 波束形成
@@ -259,7 +283,7 @@ graph LR
     C --> D["阈值计算<br>α × noise_est"]
     D --> E["比较<br>rdm² > threshold"]
     E --> F["CFAR 检出<br>目标 bin 集合"]
-    
+  
     style F fill:#66bb6a,color:#000
 ```
 
@@ -280,6 +304,7 @@ graph LR
 对每个检出的 (Doppler, Range) bin，分别在**方位**和**俯仰**方向做 Capon 角度估计：
 
 **核心算法**：
+
 ```
 1. 提取该 bin 对应的阵元复数数据向量 x (N×1)
 2. 构建协方差矩阵 R = x·x^H + δ·I (对角加载 δ = 0.1·trace(R)/N)
@@ -295,10 +320,10 @@ graph LR
 
 ### 5.4 多峰策略
 
-| bin 来源 | 角度提取策略 | 目的 |
-|---------|------------|------|
+| bin 来源      | 角度提取策略                                 | 目的                               |
+| ------------- | -------------------------------------------- | ---------------------------------- |
 | CFAR 检出 bin | **多峰提取** (`peak_ratio=0.5, min_sep=10°`) | 分辨同一距离-速度 bin 内的多个目标 |
-| 邻域扩展 bin | **仅最强单峰** | 避免噪声区域虚假角度 |
+| 邻域扩展 bin  | **仅最强单峰**                               | 避免噪声区域虚假角度               |
 
 多峰搜索使用 NMS 风格的贪心算法：按功率降序选取，抑制间距 < 10° 的相邻峰。
 
@@ -342,7 +367,7 @@ graph LR
     F -->|"MIMO映射"| G["虚拟面阵Grid"]
     G -->|"OS-CFAR"| H["目标检出"]
     H -->|"Capon<br>波束形成"| I["3D点云<br>(x,y,z,v,I)"]
-    
+  
     style A fill:#4fc3f7,color:#000
     style I fill:#66bb6a,color:#000
 ```
