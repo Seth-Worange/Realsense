@@ -2,7 +2,7 @@
 Author: Orange
 Date: 2026-02-26 16:53
 LastEditors: Orange
-LastEditTime: 2026-03-05 15:50
+LastEditTime: 2026-03-06 11:29
 FilePath: radar_generate.py
 Description: Vectorized simulator for mmWave FMCW Radar Human Echoes
              Supports single-frame (PNG) and continuous multi-frame (GIF) modes.
@@ -167,7 +167,10 @@ def render_radar_pointcloud(pc_radar, radar_pc, frame_idx=None):
 
 
 def _fig_to_pil(fig):
-    """将 matplotlib Figure 渲染为 PIL Image (RGBA → RGB)"""
+    """
+    save matplotlib figure to PIL Image
+    """
+    # use buffer to accelerate
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=120)
     buf.seek(0)
@@ -176,7 +179,9 @@ def _fig_to_pil(fig):
 
 
 def save_gif(images, output_path, fps):
-    """将 PIL Image 列表保存为 GIF 动画"""
+    """
+    Save PIL Image list to GIF
+    """
     if not images:
         print(f"  [跳过] 没有可用帧，未生成 {output_path}")
         return
@@ -193,7 +198,9 @@ def save_gif(images, output_path, fps):
 
 
 def run_single_frame(player, config, target_frame, output_dir):
-    """单帧模式: 输出静态 PNG (行为与原版一致)"""
+    """
+    Single frame mode
+    """
     print(f"读取第 {target_frame} 帧 RS 点云数据")
     pc, vel, rcs = player.get_all_as_radar_targets(frame_idx=target_frame)
 
@@ -204,7 +211,7 @@ def run_single_frame(player, config, target_frame, output_dir):
     pc_radar, vel_radar, rdm, radar_pc, range_axis, doppler_axis = process_single_frame(pc, vel, rcs, config)
     print(f"DSP 完成, 检出 {len(radar_pc)} 个雷达反射点.")
 
-    # 组合绘图 (与原版一致)
+    # Figure draw
     plt.figure(figsize=(12, 5))
 
     plt.subplot(1, 2, 1)
@@ -243,7 +250,9 @@ def run_single_frame(player, config, target_frame, output_dir):
 
 
 def run_continuous(player, config, output_dir):
-    """连续模式: 遍历全部帧，输出 3 个 GIF 动画"""
+    """
+    Continuous mode
+    """
     total_frames = player.get_frame_count()
     print(f"连续模式: 共 {total_frames} 帧, 开始逐帧仿真...")
 
@@ -258,7 +267,7 @@ def run_continuous(player, config, output_dir):
 
         pc_radar, vel_radar, rdm, radar_pc, range_axis, doppler_axis = process_single_frame(pc, vel, rcs, config)
 
-        # 渲染三张图
+        # RD-Map, RS-Pointcloud, Radar-Pointcloud
         rd_images.append(render_rd_map(rdm, range_axis, doppler_axis, frame_idx))
         rs_images.append(render_rs_pointcloud(pc_radar, vel_radar, frame_idx))
         radar_images.append(render_radar_pointcloud(pc_radar, radar_pc, frame_idx))
@@ -271,7 +280,7 @@ def run_continuous(player, config, output_dir):
     total_time = time.time() - t0
     print(f"\n全部 {len(rd_images)} 帧处理完成, 总耗时 {total_time:.1f}s")
 
-    # 保存 GIF
+    # Save GIF
     print("正在生成 GIF ...")
     fps = player.fps
     save_gif(rd_images, os.path.join(output_dir, 'rd_spectrum.gif'), fps)

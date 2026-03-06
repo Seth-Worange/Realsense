@@ -2,7 +2,7 @@
 Author: Orange
 Date: 2026-02-27 16:01
 LastEditors: Orange
-LastEditTime: 2026-02-27 16:16
+LastEditTime: 2026-03-06 12:42
 FilePath: seq_loader.py
 Description: 
     Realsense Pointcloud Data Loader
@@ -70,7 +70,7 @@ class PointCloudSequencePlayer:
 
     def next_frame_with_velocity(self):
         """
-        逐帧读取，利用帧间光流法/质心差分法近似计算当前点云的速度 (velocity) 矩阵。
+        帧间近邻匹配近似计算当前点云的速度 (velocity) 矩阵。
         
         :return: (pc_coords, velocities)
         """
@@ -107,18 +107,18 @@ class PointCloudSequencePlayer:
 
     def get_all_as_radar_targets(self, frame_idx, constant_rcs=0.1):
         """
-        转化为[pc, vel, rcs]
+        整理为[pc, vel, rcs]
         """
         # 保存原始状态以便恢复
         saved_idx = self.current_idx
         saved_prev = self.prev_pc_coords
         
         if frame_idx == 0:
-            # 如果是第 0 帧，它没有前一帧来计算速度。为了信息完整，我们借用第 1 帧算出的速度（假设初速度=第1帧速度）
+            # 第0帧速度用第1帧的速度代替
             if self.num_frames > 1:
                 self.current_idx = 0
                 self.prev_pc_coords = self.load_frame(0)[0]
-                _, next_vel = self.next_frame_with_velocity() # 这算的是 0->1 的速度
+                _, next_vel = self.next_frame_with_velocity()
                 
                 # 重新读一回第 0 帧的空间数据
                 pc, _ = self.load_frame(0)
@@ -127,7 +127,7 @@ class PointCloudSequencePlayer:
                 pc, _ = self.load_frame(0)
                 vel = np.zeros_like(pc)
         else:
-            # 正常情况：计算 frame_idx-1 -> frame_idx 的速度
+            # 计算 frame_idx-1 -> frame_idx 的速度
             self.current_idx = frame_idx                          # 直接指向目标帧
             self.prev_pc_coords = self.load_frame(frame_idx - 1)[0]  # 前一帧始终存在(frame_idx >= 1)
             pc, vel = self.next_frame_with_velocity()
